@@ -39,7 +39,7 @@ Each NPC stores:
 
 - Key, name, title, role, faction, and location.
 - Personality, desire, fear, secret, goal, and status.
-- Attitude and trust toward the player.
+- Profile-only temperament fields. Dynamic attitude and trust toward the player live in `relationships` as the authoritative `player_npc` edge, not on the NPC row.
 - A memory log that accumulates important interactions.
 - Relationship edges to the player, other NPCs, and factions.
 - `revealed_to_player`: whether the player has encountered this NPC. `/people` lists only NPCs revealed in the active game; unrevealed NPCs may still exist in state and be recalled by the LLM when the scene requires them. The LLM reveals an NPC explicitly with `npc_updates.revealed_to_player = true`; reducers never infer reveal state by parsing narration text.
@@ -139,10 +139,10 @@ Each turn prompt contains:
 - A system prompt with the locked world bible essentials: summary, language, tone, locked laws, taboos, and core conflict. Bulky or rarely-relevant world detail is omitted unless recalled.
 - A rolling game summary: a compact, periodically-refreshed digest of prior events. Older turns are folded into this summary instead of being sent in full.
 - The recent turn window: the last N turns of narration and player actions, verbatim.
-- Recalled NPCs: only NPCs relevant to the current turn (present at the location, named or addressed by the player, or recently active), each with attitude, trust, goal, status, and a bounded slice of memory log.
+- Recalled NPCs: only NPCs relevant to the current turn (present at the location, named or addressed by the player, or recently active), each with relationship-derived attitude/trust, goal, status, and a bounded slice of memory log.
 - Recalled events: durable events relevant to the current scene, selected by location, involved entities, and recency.
 - The current player state and the player's input action.
-- `game_clock`: a game-scoped `turn_number` plus an optional in-world time-of-day tag carried in the rolling summary. The LLM receives `turn_number` for pacing; no game logic depends on wall-clock time.
+- `game_clock`: a game-scoped `turn_number` plus an optional structured in-world time-of-day field stored on the game. The prompt renders this beside the rolling summary; it is not embedded inside the summary text. The LLM receives `turn_number` for pacing; no game logic depends on wall-clock time.
 
 Budget and compaction rules:
 
@@ -152,7 +152,7 @@ Budget and compaction rules:
 - `world`-scoped entries fold into the rolling game summary as a compressed digest. `npc` and `faction` entries append higher-fidelity detail to that entity memory log and a one-line digest to the rolling summary.
 - The rolling summary and each entity memory log carry independent entry caps and per-entry character caps. When one store breaches its cap, only that store is re-summarized by a dedicated LLM call; cross-store re-summarization never mixes scopes.
 - Re-summarization is the only path that rewrites a memory store; turns only append. If re-summarization fails, the previous memory store remains authoritative.
-- `game_clock` field updates such as `turn_number` and time-of-day changes are not memory rewrites; they are bounded game state fields updated by the reducer.
+- `game_clock` field updates such as `turn_number` and time-of-day changes are not memory rewrites; they are bounded game state fields updated by the reducer and rendered into prompts separately from memory stores.
 
 ### Turn Output
 
@@ -165,8 +165,9 @@ Each game turn returns:
 - `events`: durable event log entries
 - `suggested_actions`: 3-5 suggested next actions
 - `memory_update`: compact memory summary addition
-- `time_advance`: optional hint such as `minutes`, `hours`, or `overnight`; it updates only the in-world time-of-day tag in the rolling summary. It has no automatic vitals decay effect.
-- `safety_flags`: list of final moderation action records, not raw advisory signals
+- `time_advance`: optional hint such as `minutes`, `hours`, or `overnight`; it updates only the structured in-world time-of-day field on the game. It has no automatic vitals decay effect.
+
+The LLM `TurnOutput` does not include final `safety_flags`; those are worker-side records attached to the resulting `turns` row when one exists and always to the `telegram_updates` row after moderation.
 
 ### State Delta Protocol
 
@@ -179,9 +180,9 @@ Each game turn returns:
 Reducer rules:
 
 - `add` on bounded numeric fields clamps to the world-bible min/max. A clamped value is `adjusted`, not `dropped`.
-- `set` on `conditions` is idempotent; `remove` drops a tag if present and is a no-op if absent.
-- `set` on `inventory.<key>` upserts only when `value` is a complete `InventoryItem`. `add` on `inventory.<key>.quantity` requires an existing item, floors at `0`, and records the floor as `adjusted`; quantity ops against missing items are `dropped`.
-- `flags.<key>` accepts only keys declared in the locked world-bible player stat schema. Unknown flags are `dropped`.
+- `set` on `conditions` is idempotent; `remove` drops a tag if present and is a no-op if absent. Adding a condition beyond the cap is `dropped`; reducers never evict old conditions implicitly.
+- `set` on `inventory.<key>` upserts only when `value` is a complete `InventoryItem`. Upserting a new item beyond the inventory cap is `dropped`; reducers never evict old inventory implicitly. `add` on `inventory.<key>.quantity` requires an existing item, floors at `0`, and records the floor as `adjusted`; quantity ops against missing items are `dropped`.
+- `flags.<key>` accepts only keys declared in the locked world-bible player stat schema. Unknown flags and flags beyond the declared cap are `dropped`; reducers never evict old flags implicitly.
 - Unknown paths, unknown condition tags, wrong value types, locked-world targets, and any attempted mutation outside `PlayerState` are `dropped`.
 - Moderation `refuse` happens before reducers and is recorded in `safety_flags`, not in `delta_dropped`.
 - Reducers persist `turns.delta_audit` with accepted, adjusted, and dropped entries; `llm_calls.delta_dropped` stores only a compact dropped-delta summary for the corresponding turn call.
@@ -190,12 +191,12 @@ Reducer rules:
 
 Both player input and LLM-generated narration pass moderation before mutation. Moderation may be implemented by rules or by a separate moderation model; only model-backed checks create `llm_calls` rows with `purpose=moderation`.
 
-- Input moderation runs first. `refuse` short-circuits with a refusal message in `reply_payload`, emits no turn-purpose LLM call, applies no `state_delta`, and consumes the `update_id`. `warn` appends an input-stage safety flag and continues into the normal turn.
+- Input moderation runs first. `refuse` short-circuits with a refusal message in `reply_payload`, emits no turn-purpose LLM call, applies no `state_delta`, writes the update as terminal `completed`, and consumes the `update_id`. `warn` appends an input-stage safety flag and continues into the normal turn.
 - Output moderation runs on the raw LLM `TurnOutput` before reducers.
 - On `soften`, the worker re-prompts the LLM once for a rewrite with the flagged output discarded. If the second pass still flags, the action downgrades to `refuse`.
 - On `refuse`, the worker drops the proposed `state_delta`, `npc_updates`, `relationship_updates`, `events`, `memory_update`, and `suggested_actions`, emits in-world refusal narration, and keeps the row `completed`.
 - On `warn`, the worker keeps narration and deltas, then appends a `safety_flags.warning` entry.
-- `safety_flags` is a list of records; a single update may contain both an input-stage warning and an output-stage action. Each record has `{stage: input|output, flag, action: soften|refuse|warn, rewrites: 0|1}`.
+- Worker-side `safety_flags` is a list of records; a single update may contain both an input-stage warning and an output-stage action. Each record has `{stage: input|output, flag, action: soften|refuse|warn, rewrites: 0|1}`.
 - Moderation failure policy is conservative and stage-specific: input moderation failure allows the turn with a warning safety flag; output moderation failure treats the output as `refuse`.
 - A refused or softened update is still ordered under the worker lock and consumes its `update_id`.
 
@@ -211,7 +212,7 @@ Both player input and LLM-generated narration pass moderation before mutation. M
 - `currency`: bounded numeric balances
 - `conditions`: a bounded set of status tags (for example `wounded`, `hunted`), default cap `16` unless the world bible overrides it
 - `flags`: a small key/value map for narrative state the world relies on, default cap `64` declared keys unless the world bible overrides it
-- `inventory`: a bounded list of `InventoryItem`
+- `inventory`: a bounded list of `InventoryItem`, default cap `64` items unless the world bible overrides it
 
 ### InventoryItem
 
@@ -230,6 +231,7 @@ NPC fields are defined canonically in Persistent NPCs and are persisted in the `
 - On acquiring a user's lock, the worker handles that user's lowest pending turn-producing `update_id` — not necessarily the update it popped — so a user's actions are processed in Telegram order even across multiple workers.
 - A worker never blocks on a held lock. Turn-producing updates are not buffered or stacked: when update N is claimed for processing, the same transaction marks any other pending turn-producing updates for that user with a higher `update_id` as `dropped` with `blocked_by_update_id=N`; any turn-producing update that arrives while a user's row is already `processing` is inserted directly as `dropped` with the same field. The user gets a brief in-game "still acting" notice. A re-enqueued duplicate of the update already in flight (same `update_id`) is recognized by its status and skipped as a no-op, never re-dropped or re-notified.
 - Per-user rate limiting is enforced at the worker lock boundary after the user lock is acquired and before any LLM turn call. A turn in flight drops competing turn-producing updates with `drop_reason=in_flight`; a configurable sliding-window turns-per-minute cap drops fast-typing floods with `drop_reason=rate_limited`. Both paths use the same `reply_payload` delivery mechanism so dropped notices stay consistent.
+- Non-turn-producing updates such as read-only commands (`/status`, `/people`, `/world`, `/inventory`, `/archive`) and archived-view callbacks are still recorded in `telegram_updates`, but bypass the turn lock, turn ordering, and turn rate limit. They read the latest committed state and reply from that snapshot. They must not call the turn LLM or mutate game state.
 - Telegram `update_id` values are idempotency keys stored in `telegram_updates`. The inbox row, not the Redis queue, is the source of truth. A webhook retry never creates a duplicate row: for a `pending` or `processing` update it ensures the update is enqueued (re-enqueue is idempotent — the worker dedupes by status and the per-user lock) and returns; for a terminal update with a `reply_payload`, it re-sends the stored reply and never triggers a second LLM call. The time-sensitive `dropped` notice is re-sent only by such near-immediate webhook retries, never by the later reconciler (see Update Lifecycle).
 - The worker commits game mutations and the outbound reply payload in one transaction (`processing` → `completed`) only if its `lease_owner` and `lease_token` still match the row. It then sends the reply to Telegram and records the delivered `telegram_message_ids`. Sending is always driven from the stored reply payload, never by re-running the LLM, so any retry — in-process, from webhook retry, or by the reconciler — reuses it.
 - Callback data must stay within Telegram's 64-byte limit; it carries an opaque id referencing a `suggested_actions` row scoped to its game and turn. Callbacks from an earlier turn or game are rejected with a gentle notice.
@@ -249,7 +251,7 @@ Durable tables:
 - `turns`: ordered game history, including opening turn sequence `0`, player input, narration, `delta_audit`, safety flag list, and the game clock snapshot for that turn.
 - `events`: durable event log entries produced by turns, scoped to the game and indexed by location, involved entities, and recency so context assembly can recall the relevant ones.
 - `suggested_actions`: rows scoped to `(game_id, turn_id)` with an opaque callback id. Retention is bounded: rows older than the last K turns of the active game are hard-deleted by a periodic sweeper. Missing action ids are treated as stale with a gentle notice. On game archive, all suggested actions for that game are deleted; callbacks referencing an archived game are rejected at game-state lookup.
-- `llm_calls`: scoped to `(game_id, turn_id)` where applicable, with purpose (`world_build`, `turn`, `repair`, `resummarize`, `moderation`), provider, model, `mode_used` (`strict`, `json_object`, `repair`), request messages or hash, raw response text, parsed payload when valid, token counts, latency, outcome (`ok`, `schema_invalid`, `provider_timeout`, `repair_failed`, `moderation_blocked`), `delta_dropped` summary for turn calls, error text, and timestamp. Retention is bounded per game, and rows are deleted on archive.
+- `llm_calls`: scoped to `(game_id, turn_id)` where applicable, with purpose (`world_build`, `turn`, `repair`, `resummarize`, `moderation`, `soften_rewrite`), provider, model, `mode_used` (`strict`, `json_object`, `repair`), request messages or hash, raw response text, parsed payload when valid, token counts, latency, outcome (`ok`, `schema_invalid`, `provider_timeout`, `repair_failed`, `moderation_blocked`), `delta_dropped` summary for turn calls, error text, and timestamp. Retention is bounded per game, and rows are deleted on archive.
 - `telegram_updates`: durable inbox/outbox keyed by `update_id`, with `telegram_user_id`, `telegram_chat_id`, update kind, turn-producing flag, `status` (`pending`, `processing`, `completed`, `dropped`, `failed`), `drop_reason` (`in_flight`, `rate_limited`, `stale_callback`, `archived_game`, `duplicate`, or `other`), `blocked_by_update_id` for in-flight drops, `lease_owner`, `lease_token`, `lease_expires_at`, `next_retry_at`, raw update payload, optional `game_id`, optional `turn_id`, `retry_count`, error text, an ordered `reply_payload` (one or more outbound messages), the delivered `telegram_message_ids`, and timestamps.
 
 Faction membership model: an NPC's current allegiance is stored only on `npcs.faction`. `relationships` edges carry standing toward a faction, never authoritative membership.
@@ -273,7 +275,7 @@ Each `telegram_updates` row moves through a status machine:
 - `processing`: claimed by a worker that holds the user's lock. The same lock lease bounds the row through `lease_owner`, `lease_token`, and `lease_expires_at`; heartbeat renewal keeps it alive while the worker is healthy, including provider backoff between retries, after which the row can be reclaimed.
 - `completed`: game mutations and the normal reply payload are committed. The reply may not have reached Telegram yet; `telegram_message_ids` is filled in as messages are delivered.
 - `dropped`: rejected without LLM processing or game mutation, with `drop_reason` set for cases such as `in_flight`, `rate_limited`, `stale_callback`, or `archived_game`. The brief notice to the player is stored in `reply_payload` and delivered through the same outbox path.
-- `failed`: the turn could not be produced (provider timeout, or validation failure after the repair retry). Bounded by `retry_count`: retries remain `processing`, set `next_retry_at`, and keep the lease alive through heartbeat during backoff. Once retry cap is exhausted, the worker writes terminal `failed` with a recoverable in-game failure message in `reply_payload`. A `failed` row never leaves durable game state mutated.
+- `failed`: the turn could not be produced (provider timeout, or validation failure after the repair retry). Bounded by `retry_count`: retries remain `processing`, set `next_retry_at`, and keep the lease alive through heartbeat during backoff. The same worker sleeps until `next_retry_at` rather than using delayed Redis requeue. Once retry cap is exhausted, the worker writes terminal `failed` with a recoverable in-game failure message in `reply_payload`. A `failed` row never leaves durable game state mutated.
 
 `completed`, `dropped`, and `failed` are terminal; `pending` and `processing` are not.
 
