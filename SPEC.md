@@ -180,8 +180,8 @@ NPC fields are defined canonically in Persistent NPCs and are persisted in the `
 - Webhook ingress must not call the LLM directly. It verifies the secret, inserts a durable inbox row keyed by `update_id`, and enqueues only newly-created pending updates.
 - The worker processes at most one turn per Telegram user at a time, enforced by a per-user Redis lock held under a TTL lease so a crashed worker cannot hold it forever. The global queue is an ingress buffer only; serialization comes from the lock.
 - A worker never blocks waiting on a held lock. When an update arrives for a user whose turn is already in flight, it is not buffered or stacked; the user gets a brief in-game "still acting" notice and the update is dropped.
-- Telegram `update_id` values are idempotency keys stored in `telegram_updates`. A webhook retry for a pending update returns successfully without enqueueing a duplicate; a retry for a completed update re-sends the stored reply payload and never triggers a second LLM call.
-- The worker commits game mutations and the corresponding outbound reply payload in one transaction, then sends the reply to Telegram. If Telegram send fails after commit, retry uses the stored reply payload instead of re-running the LLM.
+- Telegram `update_id` values are idempotency keys stored in `telegram_updates`. The inbox row, not the Redis queue, is the source of truth. A webhook retry never creates a duplicate row: for a `pending` or `processing` update it ensures the update is enqueued (re-enqueue is idempotent — the worker dedupes by status and the per-user lock) and returns; for a terminal update with a `reply_payload`, it re-sends the stored reply and never triggers a second LLM call.
+- The worker commits game mutations and the outbound reply payload in one transaction (`processing` → `completed`), then sends the reply to Telegram and records the delivered `telegram_message_ids`. Sending is always driven from the stored reply payload, never by re-running the LLM, so any retry — in-process, from webhook retry, or by the reconciler — reuses it.
 - Callback data must stay within Telegram's 64-byte limit; it carries an opaque id referencing a `suggested_actions` row scoped to its game and turn. Callbacks from an earlier turn or game are rejected with a gentle notice.
 - LLM failures must not mutate durable game state.
 - Reducers clamp numeric values to their world-defined bounds and reject or ignore invalid deltas.
@@ -198,7 +198,7 @@ Durable tables:
 - `turns`
 - `suggested_actions`
 - `llm_calls`
-- `telegram_updates`: durable inbox/outbox keyed by `update_id`, with `status` (`pending`, `processing`, `completed`, `dropped`, `failed`), raw update payload, optional `game_id`, optional `turn_id`, retry count, error text, `reply_payload`, `telegram_message_id`, and timestamps.
+- `telegram_updates`: durable inbox/outbox keyed by `update_id`, with `status` (`pending`, `processing`, `completed`, `dropped`, `failed`), a processing `lease` deadline, raw update payload, optional `game_id`, optional `turn_id`, `retry_count`, error text, an ordered `reply_payload` (one or more outbound messages), the delivered `telegram_message_ids`, and timestamps.
 
 Transient Redis keys:
 
@@ -206,6 +206,24 @@ Transient Redis keys:
 - `llm_rpg:lock:user:{telegram_user_id}`: per-player lock
 - `llm_rpg:tg_state:{telegram_user_id}`: worldbuilding flow state
 - `llm_rpg:pending_world:{telegram_user_id}`: generated world awaiting confirmation
+
+## Update Lifecycle and Recovery
+
+Each `telegram_updates` row moves through a status machine:
+
+- `pending`: durably recorded at ingress and enqueued, not yet picked up.
+- `processing`: claimed by a worker that holds the user's lock. The claim sets a `lease` deadline so a crashed worker's row can be reclaimed.
+- `completed`: game mutations and the normal reply payload are committed. The reply may not have reached Telegram yet; `telegram_message_ids` is filled in as messages are delivered.
+- `dropped`: rejected without LLM processing or game mutation — for example a second action that arrived while the user's turn was already in flight (see State Rules). The brief notice to the player is stored in `reply_payload` and delivered through the same outbox path.
+- `failed`: the turn could not be produced (provider timeout, or validation failure after the repair retry). Bounded by `retry_count`: the worker retries with backoff up to a cap, then leaves the row `failed` with a recoverable in-game failure message in `reply_payload`. A `failed` row never leaves durable game state mutated.
+
+A periodic reconciler makes the inbox/outbox crash-safe by scanning durable rows instead of trusting the Redis queue:
+
+- Re-enqueues `pending` rows that are not in flight — covers a crash between the DB insert and the Redis enqueue, and a flushed Redis queue.
+- Reclaims `processing` rows whose `lease` has expired — covers a worker that crashed mid-turn.
+- Re-sends terminal rows (`completed`, `dropped`, or `failed`) still missing one or more `telegram_message_ids` — covers a crash after commit but before the Telegram send, which Telegram itself will not retry because ingress already returned 200.
+
+A turn may emit more than one outbound message. The `reply_payload` stores them in order, and recovery sends the tail not yet present in `telegram_message_ids`. This is best-effort rather than perfect send idempotency: if Telegram accepts a message but the service crashes before recording its `telegram_message_id`, the reconciler may send a visible duplicate. Each outbound message should carry a stable update or turn marker so duplicate deliveries are recognizable and operationally reconcilable.
 
 ## Production Behavior
 
