@@ -42,6 +42,7 @@ Each NPC stores:
 - Attitude and trust toward the player.
 - A memory log that accumulates important interactions.
 - Relationship edges to the player, other NPCs, and factions.
+- `revealed_to_player`: whether the player has encountered this NPC. `/people` lists only NPCs revealed in the active game; unrevealed NPCs may still exist in state and be recalled by the LLM when the scene requires them. The LLM reveals an NPC explicitly with `npc_updates.revealed_to_player = true`; reducers never infer reveal state by parsing narration text.
 
 NPCs can:
 
@@ -79,9 +80,17 @@ NPCs can:
 - `/people`: show known persistent NPCs.
 - `/status`: show current player state.
 - `/inventory`: show inventory.
-- `/reset`: archive current game and start over.
+- `/reset`: archive current game and start over; asks for confirmation if a game is active.
+- `/archive`: list the player's archived games and read-only summaries.
 - `/help`: show commands.
 - `/admin_stats`: admin-only operational stats.
+
+### Archive Semantics
+
+- An archived game's locked `WorldBible`, narration history, NPCs, and events are preserved read-only.
+- `/world`, `/people`, `/inventory`, and `/status` operate on the active game only. Archived games are inspected through archived views: read-only summary, no callbacks accepted, and no suggested actions retained.
+- A player has at most one active game. Archived games are queryable but cannot be resumed; resuming would break immutable-world assumptions across the gap.
+- Hard-deletion of an archived game is admin-only and gated by the admin allowlist.
 
 ## LLM Contract
 
@@ -92,9 +101,9 @@ The app uses an OpenAI-compatible Chat Completions client with:
 - `LLM_BASE_URL`
 - `LLM_API_KEY`
 - `LLM_MODEL`
-- `LLM_STRUCTURED_MODE`
+- `LLM_STRUCTURED_MODE`: one of `strict`, `json_object`, or `auto`. `strict` requires JSON schema support and fails if unsupported. `json_object` uses JSON object mode plus Pydantic validation with one repair retry. `auto` probes for strict support and downgrades to `json_object` on provider-feature failure. Default: `auto`.
 
-The provider prefers JSON schema structured output. If the upstream model does not support strict schemas, it falls back to JSON object mode and Pydantic validation with one repair retry.
+The provider prefers JSON schema structured output according to `LLM_STRUCTURED_MODE`; validation always happens locally before any reducer applies model output.
 
 ### WorldBuilder Output
 
@@ -105,12 +114,14 @@ The provider prefers JSON schema structured output. If the upstream model does n
 - `player_state`
 - `initial_suggested_actions`
 
+On confirmation, the opening narration is persisted as an opening turn row with sequence `0`; `initial_suggested_actions` attach to that opening turn through normal `(game_id, turn_id)` scoping.
+
 `WorldBible` includes:
 
 - Summary, language, genre, tone, era/geography
 - Locked laws
 - Factions (materialized into the `factions` table on confirmation)
-- Player stat schema: the `vitals` and `currency` keys with their min/max bounds and the allowed `conditions` tags, used by reducers to clamp `state_delta`
+- Player stat schema: the `vitals` and `currency` keys with their min/max bounds, allowed `conditions` tags, allowed `flags` keys, and optional caps used by reducers to validate `state_delta`
 - Initial location
 - Initial NPCs
 - Dangers
@@ -131,13 +142,17 @@ Each turn prompt contains:
 - Recalled NPCs: only NPCs relevant to the current turn (present at the location, named or addressed by the player, or recently active), each with attitude, trust, goal, status, and a bounded slice of memory log.
 - Recalled events: durable events relevant to the current scene, selected by location, involved entities, and recency.
 - The current player state and the player's input action.
+- `game_clock`: a game-scoped `turn_number` plus an optional in-world time-of-day tag carried in the rolling summary. The LLM receives `turn_number` for pacing; no game logic depends on wall-clock time.
 
 Budget and compaction rules:
 
 - A configurable token budget (`LLM_CONTEXT_TOKEN_BUDGET`) caps total prompt size. Sections are filled in priority order: world essentials, player state and input, recent turn window, recalled NPCs, recalled events, rolling summary.
 - When state exceeds the budget, the oldest or least-relevant detail is dropped first and folded into the rolling summary.
-- `memory_update` from each turn output appends to the rolling summary and, when scoped to an NPC, to that NPC's memory log.
-- NPC memory logs and the rolling summary are themselves bounded; when they grow past their cap they are re-summarized.
+- `memory_update` entries are scoped: `world`, `npc:<key>`, or `faction:<key>`.
+- `world`-scoped entries fold into the rolling game summary as a compressed digest. `npc` and `faction` entries append higher-fidelity detail to that entity memory log and a one-line digest to the rolling summary.
+- The rolling summary and each entity memory log carry independent entry caps and per-entry character caps. When one store breaches its cap, only that store is re-summarized by a dedicated LLM call; cross-store re-summarization never mixes scopes.
+- Re-summarization is the only path that rewrites a memory store; turns only append. If re-summarization fails, the previous memory store remains authoritative.
+- `game_clock` field updates such as `turn_number` and time-of-day changes are not memory rewrites; they are bounded game state fields updated by the reducer.
 
 ### Turn Output
 
@@ -150,7 +165,39 @@ Each game turn returns:
 - `events`: durable event log entries
 - `suggested_actions`: 3-5 suggested next actions
 - `memory_update`: compact memory summary addition
-- `safety_flags`: optional moderation or safety notes
+- `time_advance`: optional hint such as `minutes`, `hours`, or `overnight`; it updates only the in-world time-of-day tag in the rolling summary. It has no automatic vitals decay effect.
+- `safety_flags`: list of final moderation action records, not raw advisory signals
+
+### State Delta Protocol
+
+`state_delta` is a list of typed operations, not free-form field assignments. Each delta entry carries:
+
+- `path`: dotted path into `PlayerState`, for example `vitals.hp`, `currency.gold`, `conditions`, `inventory.<key>`, `inventory.<key>.quantity`, or `flags.<key>`.
+- `op`: one of `set`, `add`, or `remove`. `clamp` is reducer-local behavior and is never emitted by the LLM.
+- `value`: numeric for bounded `set`/`add`, a tag string for `conditions`, a boolean/string/number for declared flags, or a full `InventoryItem` for inventory upsert.
+
+Reducer rules:
+
+- `add` on bounded numeric fields clamps to the world-bible min/max. A clamped value is `adjusted`, not `dropped`.
+- `set` on `conditions` is idempotent; `remove` drops a tag if present and is a no-op if absent.
+- `set` on `inventory.<key>` upserts only when `value` is a complete `InventoryItem`. `add` on `inventory.<key>.quantity` requires an existing item, floors at `0`, and records the floor as `adjusted`; quantity ops against missing items are `dropped`.
+- `flags.<key>` accepts only keys declared in the locked world-bible player stat schema. Unknown flags are `dropped`.
+- Unknown paths, unknown condition tags, wrong value types, locked-world targets, and any attempted mutation outside `PlayerState` are `dropped`.
+- Moderation `refuse` happens before reducers and is recorded in `safety_flags`, not in `delta_dropped`.
+- Reducers persist `turns.delta_audit` with accepted, adjusted, and dropped entries; `llm_calls.delta_dropped` stores only a compact dropped-delta summary for the corresponding turn call.
+
+### Moderation Pipeline
+
+Both player input and LLM-generated narration pass moderation before mutation. Moderation may be implemented by rules or by a separate moderation model; only model-backed checks create `llm_calls` rows with `purpose=moderation`.
+
+- Input moderation runs first. `refuse` short-circuits with a refusal message in `reply_payload`, emits no turn-purpose LLM call, applies no `state_delta`, and consumes the `update_id`. `warn` appends an input-stage safety flag and continues into the normal turn.
+- Output moderation runs on the raw LLM `TurnOutput` before reducers.
+- On `soften`, the worker re-prompts the LLM once for a rewrite with the flagged output discarded. If the second pass still flags, the action downgrades to `refuse`.
+- On `refuse`, the worker drops the proposed `state_delta`, `npc_updates`, `relationship_updates`, `events`, `memory_update`, and `suggested_actions`, emits in-world refusal narration, and keeps the row `completed`.
+- On `warn`, the worker keeps narration and deltas, then appends a `safety_flags.warning` entry.
+- `safety_flags` is a list of records; a single update may contain both an input-stage warning and an output-stage action. Each record has `{stage: input|output, flag, action: soften|refuse|warn, rewrites: 0|1}`.
+- Moderation failure policy is conservative and stage-specific: input moderation failure allows the turn with a warning safety flag; output moderation failure treats the output as `refuse`.
+- A refused or softened update is still ordered under the worker lock and consumes its `update_id`.
 
 ## Game State Schemas
 
@@ -162,8 +209,8 @@ Each game turn returns:
 - `location`: current location key
 - `vitals`: bounded numeric gauges (for example `hp`, `energy`, `morale`), each with a min/max fixed at world creation
 - `currency`: bounded numeric balances
-- `conditions`: a bounded set of status tags (for example `wounded`, `hunted`)
-- `flags`: a small key/value map for narrative state the world relies on
+- `conditions`: a bounded set of status tags (for example `wounded`, `hunted`), default cap `16` unless the world bible overrides it
+- `flags`: a small key/value map for narrative state the world relies on, default cap `64` declared keys unless the world bible overrides it
 - `inventory`: a bounded list of `InventoryItem`
 
 ### InventoryItem
@@ -182,11 +229,12 @@ NPC fields are defined canonically in Persistent NPCs and are persisted in the `
 - The worker processes at most one turn per Telegram user at a time via a per-user Redis lock. The lock carries a TTL lease renewed by a heartbeat task independent of the LLM await path, and every LLM/provider call has a hard timeout. This same lease is mirrored onto the `processing` row as `lease_owner`, `lease_token`, and `lease_expires_at`; terminal writes use compare-and-set on those fields, so a stale worker whose lease was reclaimed cannot commit late output.
 - On acquiring a user's lock, the worker handles that user's lowest pending turn-producing `update_id` — not necessarily the update it popped — so a user's actions are processed in Telegram order even across multiple workers.
 - A worker never blocks on a held lock. Turn-producing updates are not buffered or stacked: when update N is claimed for processing, the same transaction marks any other pending turn-producing updates for that user with a higher `update_id` as `dropped` with `blocked_by_update_id=N`; any turn-producing update that arrives while a user's row is already `processing` is inserted directly as `dropped` with the same field. The user gets a brief in-game "still acting" notice. A re-enqueued duplicate of the update already in flight (same `update_id`) is recognized by its status and skipped as a no-op, never re-dropped or re-notified.
+- Per-user rate limiting is enforced at the worker lock boundary after the user lock is acquired and before any LLM turn call. A turn in flight drops competing turn-producing updates with `drop_reason=in_flight`; a configurable sliding-window turns-per-minute cap drops fast-typing floods with `drop_reason=rate_limited`. Both paths use the same `reply_payload` delivery mechanism so dropped notices stay consistent.
 - Telegram `update_id` values are idempotency keys stored in `telegram_updates`. The inbox row, not the Redis queue, is the source of truth. A webhook retry never creates a duplicate row: for a `pending` or `processing` update it ensures the update is enqueued (re-enqueue is idempotent — the worker dedupes by status and the per-user lock) and returns; for a terminal update with a `reply_payload`, it re-sends the stored reply and never triggers a second LLM call. The time-sensitive `dropped` notice is re-sent only by such near-immediate webhook retries, never by the later reconciler (see Update Lifecycle).
 - The worker commits game mutations and the outbound reply payload in one transaction (`processing` → `completed`) only if its `lease_owner` and `lease_token` still match the row. It then sends the reply to Telegram and records the delivered `telegram_message_ids`. Sending is always driven from the stored reply payload, never by re-running the LLM, so any retry — in-process, from webhook retry, or by the reconciler — reuses it.
 - Callback data must stay within Telegram's 64-byte limit; it carries an opaque id referencing a `suggested_actions` row scoped to its game and turn. Callbacks from an earlier turn or game are rejected with a gentle notice.
 - LLM failures must not mutate durable game state.
-- Reducers clamp numeric values to their world-defined bounds and reject or ignore invalid deltas.
+- Reducers apply the State Delta Protocol, clamp numeric values to their world-defined bounds, and audit accepted, adjusted, and dropped deltas.
 - The locked world bible is read-only after confirmation. No turn-output field can mutate it, and reducers drop any delta targeting locked world content.
 
 ## Data Model
@@ -194,15 +242,21 @@ NPC fields are defined canonically in Persistent NPCs and are persisted in the `
 Durable tables:
 
 - `players`
-- `games`: per-player game holding the locked `WorldBible`, the current `PlayerState` snapshot, the rolling game summary, and active/archived status (at most one active per player).
-- `factions`: faction entities materialized from the locked `WorldBible` at confirmation, keyed and scoped to the game. Holds each faction's static identity (key, name, description, ideology); identity is read-only after confirmation, while dynamic standing lives in `relationships`. Referenced by `npcs.faction` and by relationship edges via faction key.
+- `games`: per-player game holding the locked `WorldBible`, the current `PlayerState` snapshot, the rolling game summary, `turn_number`, optional time-of-day tag, and active/archived status (at most one active per player).
+- `factions`: faction entities materialized from the locked `WorldBible` at confirmation, keyed and scoped to the game. Holds each faction's static identity (key, name, description, ideology) plus a dynamic `memory_log`; identity is read-only after confirmation, while dynamic standing lives in `relationships`. Referenced by `npcs.faction` and by relationship edges via faction key.
 - `npcs`
-- `relationships`: edges among the player, NPCs, and factions, referenced by key.
-- `turns`
+- `relationships`: edges among the player, NPCs, and factions, referenced by key, with `edge_type` (`player_npc`, `npc_npc`, `player_faction`, `npc_faction`, `faction_faction`) and numeric standing/trust fields.
+- `turns`: ordered game history, including opening turn sequence `0`, player input, narration, `delta_audit`, safety flag list, and the game clock snapshot for that turn.
 - `events`: durable event log entries produced by turns, scoped to the game and indexed by location, involved entities, and recency so context assembly can recall the relevant ones.
-- `suggested_actions`
-- `llm_calls`
-- `telegram_updates`: durable inbox/outbox keyed by `update_id`, with `telegram_user_id`, `telegram_chat_id`, update kind, turn-producing flag, `status` (`pending`, `processing`, `completed`, `dropped`, `failed`), `blocked_by_update_id` for in-flight drops, `lease_owner`, `lease_token`, `lease_expires_at`, raw update payload, optional `game_id`, optional `turn_id`, `retry_count`, error text, an ordered `reply_payload` (one or more outbound messages), the delivered `telegram_message_ids`, and timestamps.
+- `suggested_actions`: rows scoped to `(game_id, turn_id)` with an opaque callback id. Retention is bounded: rows older than the last K turns of the active game are hard-deleted by a periodic sweeper. Missing action ids are treated as stale with a gentle notice. On game archive, all suggested actions for that game are deleted; callbacks referencing an archived game are rejected at game-state lookup.
+- `llm_calls`: scoped to `(game_id, turn_id)` where applicable, with purpose (`world_build`, `turn`, `repair`, `resummarize`, `moderation`), provider, model, `mode_used` (`strict`, `json_object`, `repair`), request messages or hash, raw response text, parsed payload when valid, token counts, latency, outcome (`ok`, `schema_invalid`, `provider_timeout`, `repair_failed`, `moderation_blocked`), `delta_dropped` summary for turn calls, error text, and timestamp. Retention is bounded per game, and rows are deleted on archive.
+- `telegram_updates`: durable inbox/outbox keyed by `update_id`, with `telegram_user_id`, `telegram_chat_id`, update kind, turn-producing flag, `status` (`pending`, `processing`, `completed`, `dropped`, `failed`), `drop_reason` (`in_flight`, `rate_limited`, `stale_callback`, `archived_game`, `duplicate`, or `other`), `blocked_by_update_id` for in-flight drops, `lease_owner`, `lease_token`, `lease_expires_at`, `next_retry_at`, raw update payload, optional `game_id`, optional `turn_id`, `retry_count`, error text, an ordered `reply_payload` (one or more outbound messages), the delivered `telegram_message_ids`, and timestamps.
+
+Faction membership model: an NPC's current allegiance is stored only on `npcs.faction`. `relationships` edges carry standing toward a faction, never authoritative membership.
+
+- A betrayal turn that switches allegiance writes `npc_updates.faction = <new faction key>`; reducers apply it directly to `npcs.faction`.
+- Standing edges toward the prior faction and the new faction are updated in the same transaction via `relationship_updates`.
+- Faction identity is read-only after world confirmation; only standing edges and `npcs.faction` move.
 
 Transient Redis keys:
 
@@ -216,10 +270,10 @@ Transient Redis keys:
 Each `telegram_updates` row moves through a status machine:
 
 - `pending`: durably recorded at ingress and queued for processing, or awaiting (re-)enqueue by the reconciler if the original enqueue was lost. Not yet picked up.
-- `processing`: claimed by a worker that holds the user's lock. The same lock lease bounds the row through `lease_owner`, `lease_token`, and `lease_expires_at`; heartbeat renewal keeps it alive while the worker is healthy, after which the row can be reclaimed.
+- `processing`: claimed by a worker that holds the user's lock. The same lock lease bounds the row through `lease_owner`, `lease_token`, and `lease_expires_at`; heartbeat renewal keeps it alive while the worker is healthy, including provider backoff between retries, after which the row can be reclaimed.
 - `completed`: game mutations and the normal reply payload are committed. The reply may not have reached Telegram yet; `telegram_message_ids` is filled in as messages are delivered.
-- `dropped`: rejected without LLM processing or game mutation — for example a second action that arrived while the user's turn was already in flight (see State Rules). The brief notice to the player is stored in `reply_payload` and delivered through the same outbox path.
-- `failed`: the turn could not be produced (provider timeout, or validation failure after the repair retry). Bounded by `retry_count`: the worker retries with backoff up to a cap, then leaves the row `failed` with a recoverable in-game failure message in `reply_payload`. A `failed` row never leaves durable game state mutated.
+- `dropped`: rejected without LLM processing or game mutation, with `drop_reason` set for cases such as `in_flight`, `rate_limited`, `stale_callback`, or `archived_game`. The brief notice to the player is stored in `reply_payload` and delivered through the same outbox path.
+- `failed`: the turn could not be produced (provider timeout, or validation failure after the repair retry). Bounded by `retry_count`: retries remain `processing`, set `next_retry_at`, and keep the lease alive through heartbeat during backoff. Once retry cap is exhausted, the worker writes terminal `failed` with a recoverable in-game failure message in `reply_payload`. A `failed` row never leaves durable game state mutated.
 
 `completed`, `dropped`, and `failed` are terminal; `pending` and `processing` are not.
 
@@ -227,9 +281,9 @@ A periodic reconciler makes the inbox/outbox crash-safe by scanning durable rows
 
 - Re-enqueues `pending` rows that are not in flight — covers a crash between the DB insert and the Redis enqueue, and a flushed Redis queue.
 - Reclaims `processing` rows whose `lease_expires_at` has expired by re-enqueueing them; the next worker re-acquires the user lock, writes a fresh `lease_owner`/`lease_token`, and re-checks the status before acting. If the old worker later returns from the LLM call, its compare-and-set terminal write fails and its output is discarded — covers a worker that crashed or lost its lease mid-turn.
-- Re-sends `completed` and `failed` rows still missing one or more `telegram_message_ids` — covers a crash after commit but before the Telegram send, which Telegram itself will not retry because ingress already returned 200. `dropped` notices are time-sensitive ("still acting") and are sent best-effort once, never re-sent, so a stale notice never surprises the player later.
+- Re-sends terminal `completed` and `failed` rows still missing one or more `telegram_message_ids` — covers a crash after commit but before the Telegram send, which Telegram itself will not retry because ingress already returned 200. `dropped` notices are time-sensitive ("still acting") and are sent best-effort once, never re-sent, so a stale notice never surprises the player later.
 
-A turn may emit more than one outbound message. The `reply_payload` stores them in order, and recovery sends the tail not yet present in `telegram_message_ids`. This is best-effort rather than perfect send idempotency: if Telegram accepts a message but the service crashes before recording its `telegram_message_id`, the reconciler may send a visible duplicate. Each outbound message should carry a stable update or turn marker so duplicate deliveries are recognizable and operationally reconcilable.
+A turn may emit more than one outbound message. For `completed` and `failed` rows, `reply_payload` stores messages in order, and recovery sends the tail not yet present in `telegram_message_ids`. This is best-effort rather than perfect send idempotency: if Telegram accepts a message but the service crashes before recording its `telegram_message_id`, the reconciler may send a visible duplicate. Each outbound message should carry a stable update or turn marker so duplicate deliveries are recognizable and operationally reconcilable.
 
 ## Production Behavior
 
@@ -241,8 +295,8 @@ A turn may emit more than one outbound message. The `reply_payload` stores them 
 - Secrets are read from environment variables only.
 - Logs are structured enough to trace update, game, and LLM call failures.
 - Health endpoints expose readiness and basic metrics.
-- Per-user rate limiting caps turn frequency to control cost and abuse. A player has at most one active game at a time; `/new` while a game is active prompts before archiving.
-- Player input and generated narration both pass moderation. A raised safety flag drives a defined response (soften, refuse, or warn), not an advisory note only.
+- A player has at most one active game at a time; `/new` while a game is active prompts before archiving.
+- Moderation follows the Moderation Pipeline and always records the final action taken.
 - Redis holds the queue, locks, and worldbuilding flow state, and is treated as ephemeral. Transient keys carry TTLs, and loss of in-progress worldbuilding state is recoverable by restarting `/new`. Durable game state never lives only in Redis.
 - Admin commands are gated by an allowlist of Telegram user ids from configuration.
 
@@ -254,15 +308,27 @@ Required coverage:
 - Locked-world behavior
 - NPC persistence and memory updates
 - State reducer bounds
+- State Delta Protocol accepted/adjusted/dropped auditing, including clamped numeric deltas, unknown paths, unknown flags, and locked-world targets
 - Suggested action callback length
 - Telegram message and callback routing
 - Idempotent update handling
 - Provider fallback and repair behavior
 - Docker Compose E2E path from `/new` to three turns
 - A deterministic fake LLM provider used across all tests, including the E2E path, so tests never call a live model
+- E2E Telegram path uses a `FakeTelegramServer` fixture in `tests/e2e/` that emulates webhook registration, accepts outbound `sendMessage` and `answerCallbackQuery`, returns incrementing `message_id`s, and replays queued updates into FastAPI ingress. The worker talks to it instead of `api.telegram.org`.
 - In-flight rejection when a user sends an action during an active turn, including `blocked_by_update_id` on rows dropped because another turn is processing
 - Stale callback rejection across turns and games
 - Context assembly staying within the token budget as game state grows
+- Scoped `memory_update` writes, independent memory caps, and failed re-summarization preserving the prior store
+- Moderation input warn continuing into a turn, input refuse short-circuit, output soften/refuse/warn handling, moderation failure policy, and refused output dropping all proposed mutations
+- Suggested action retention sweeper, missing action id stale handling, and archive deletion
+- Archive read-only views and rejection of callbacks against archived games
+- Opening turn sequence `0` and `initial_suggested_actions` attached to that turn
+- NPC reveal via explicit `npc_updates.revealed_to_player`
+- Game clock persistence on games and turn snapshots; `time_advance` updating only the in-world time tag
+- Relationship `edge_type` validation and faction membership changes via `npcs.faction`
+- Rate-limit drops at the worker lock boundary with `drop_reason=rate_limited`
+- Processing retry backoff with `next_retry_at` and heartbeat-held lease
 - Reconciler re-enqueues orphaned `pending` rows after a lost enqueue or flushed queue
 - Reclaim of an expired `processing` lease without double-processing a slow-but-alive worker, including `lease_owner`/`lease_token` compare-and-set preventing stale commits
 - Re-send of `completed`/`failed` rows missing `telegram_message_ids`, and `dropped` notices not re-sent by the reconciler
