@@ -1,0 +1,241 @@
+# Telegram LLM Text RPG Specification
+
+## Product Goal
+
+Build a production-ready Telegram Bot text RPG where players can type any action in natural language or tap LLM-generated action buttons. The default experience is Chinese, with a focus on open-ended narrative play, persistent NPCs, and world simulation through text.
+
+The game is inspired by AI text RPG design patterns such as:
+
+- Text as the primary interface, not a fallback for missing graphics.
+- A computable world state beneath the prose.
+- Open-ended player actions adjudicated by an LLM.
+- NPCs with goals, memory, relationships, and faction loyalties.
+- Dynamic consequences that survive across turns.
+
+## Core Experience
+
+### New Game Flow
+
+1. The player sends `/new`.
+2. The bot offers built-in presets and a custom world option.
+3. For a custom world, the player writes one paragraph as a world seed.
+4. The LLM expands that seed into a structured `WorldBible`.
+5. The player confirms the world preview.
+6. After confirmation, the world bible is locked and the first scene begins.
+
+### Worldbuilding Rules
+
+- Players control key direction through the seed text and preset selection.
+- The LLM builds the detailed world: laws, factions, locations, dangers, roles, NPC seeds, and narrative tone.
+- Once confirmed, the world bible is immutable.
+- Later turns may reveal new details, locations, NPCs, and consequences.
+- Later turns must not rewrite locked world laws, the core conflict, or content boundaries.
+
+### Persistent NPCs
+
+NPCs are persistent entities, not disposable dialogue text.
+
+Each NPC stores:
+
+- Key, name, title, role, faction, and location.
+- Personality, desire, fear, secret, goal, and status.
+- Attitude and trust toward the player.
+- A memory log that accumulates important interactions.
+- Relationship edges to the player, other NPCs, and factions.
+
+NPCs can:
+
+- Investigate, track, betray, trade, negotiate, spread rumors, request help, misread evidence, form alliances, and remember the player.
+- Serve as companions who can be assigned tasks such as scouting, negotiation, medicine, guard duty, or delaying enemies.
+
+## Technical Architecture
+
+### Stack
+
+- Python 3.11+
+- FastAPI for webhook ingress and health endpoints
+- aiogram for Telegram API types and message helpers
+- Postgres for durable game state
+- Redis for update queue, locks, and temporary worldbuilding state
+- SQLAlchemy 2.x async ORM
+- Alembic migrations
+- OpenAI-compatible Chat Completions provider
+- pytest for unit and integration tests
+- Docker Compose for local production-like execution
+
+### Runtime Services
+
+- `api`: FastAPI service that receives Telegram webhooks, verifies the secret, and quickly enqueues updates.
+- `worker`: async worker that pops Telegram updates, serializes work per Telegram user, calls the LLM, writes state, and sends Telegram replies.
+- `postgres`: durable data store.
+- `redis`: queue, locks, and temporary state.
+
+### Bot Commands
+
+- `/start`: welcome and short onboarding.
+- `/new`: start world creation.
+- `/worlds`: list presets and custom world option.
+- `/world`: show the current locked world summary.
+- `/people`: show known persistent NPCs.
+- `/status`: show current player state.
+- `/inventory`: show inventory.
+- `/reset`: archive current game and start over.
+- `/help`: show commands.
+- `/admin_stats`: admin-only operational stats.
+
+## LLM Contract
+
+### Provider
+
+The app uses an OpenAI-compatible Chat Completions client with:
+
+- `LLM_BASE_URL`
+- `LLM_API_KEY`
+- `LLM_MODEL`
+- `LLM_STRUCTURED_MODE`
+
+The provider prefers JSON schema structured output. If the upstream model does not support strict schemas, it falls back to JSON object mode and Pydantic validation with one repair retry.
+
+### WorldBuilder Output
+
+`WorldBuildOutput` includes:
+
+- `world`: a locked `WorldBible`
+- `opening_narration`
+- `player_state`
+- `initial_suggested_actions`
+
+`WorldBible` includes:
+
+- Summary, language, genre, tone, era/geography
+- Locked laws
+- Factions
+- Initial location
+- Initial NPCs
+- Dangers
+- Available professions or identities
+- Narrative style
+- Taboos
+- Core conflict
+
+### Turn Input and Context Assembly
+
+The worker assembles each turn's prompt from durable state under a fixed token budget. The full history is never resent verbatim; long games stay in-window through compaction and selective recall.
+
+Each turn prompt contains:
+
+- A system prompt with the locked world bible essentials: summary, language, tone, locked laws, taboos, and core conflict. Bulky or rarely-relevant world detail is omitted unless recalled.
+- A rolling game summary: a compact, periodically-refreshed digest of prior events. Older turns are folded into this summary instead of being sent in full.
+- The recent turn window: the last N turns of narration and player actions, verbatim.
+- Recalled NPCs: only NPCs relevant to the current turn (present at the location, named or addressed by the player, or recently active), each with attitude, trust, goal, status, and a bounded slice of memory log.
+- Recalled events: durable events relevant to the current scene, selected by location, involved entities, and recency.
+- The current player state and the player's input action.
+
+Budget and compaction rules:
+
+- A configurable token budget (`LLM_CONTEXT_TOKEN_BUDGET`) caps total prompt size. Sections are filled in priority order: world essentials, player state and input, recent turn window, recalled NPCs, recalled events, rolling summary.
+- When state exceeds the budget, the oldest or least-relevant detail is dropped first and folded into the rolling summary.
+- `memory_update` from each turn output appends to the rolling summary and, when scoped to an NPC, to that NPC's memory log.
+- NPC memory logs and the rolling summary are themselves bounded; when they grow past their cap they are re-summarized.
+
+### Turn Output
+
+Each game turn returns:
+
+- `narration`: prose shown to the player
+- `state_delta`: bounded player state changes
+- `npc_updates`: persistent NPC changes
+- `relationship_updates`: relationship edge changes
+- `events`: durable event log entries
+- `suggested_actions`: 3-5 suggested next actions
+- `memory_update`: compact memory summary addition
+- `safety_flags`: optional moderation or safety notes
+
+## Game State Schemas
+
+### PlayerState
+
+`PlayerState` is the bounded, reducer-managed view of the player. It is persisted as the current snapshot on the active `games` row and carried in each turn prompt. Fields:
+
+- `name`, and `profession` or identity chosen from the world bible's available roles
+- `location`: current location key
+- `vitals`: bounded numeric gauges (for example `hp`, `energy`, `morale`), each with a min/max fixed at world creation
+- `currency`: bounded numeric balances
+- `conditions`: a bounded set of status tags (for example `wounded`, `hunted`)
+- `flags`: a small key/value map for narrative state the world relies on
+- `inventory`: a bounded list of `InventoryItem`
+
+### InventoryItem
+
+- `key`, `name`, `description`
+- `quantity`: non-negative integer
+- `tags`: optional classification (for example `weapon`, `quest`)
+
+Inventory has no separate table; it lives inside `PlayerState` and is mutated only through `state_delta`. The `/inventory` command renders inventory from the active game's player state.
+
+NPC fields are defined canonically in Persistent NPCs and are persisted in the `npcs` table.
+
+## State Rules
+
+- Webhook ingress must not call the LLM directly. It verifies the secret, inserts a durable inbox row keyed by `update_id`, and enqueues only newly-created pending updates.
+- The worker processes at most one turn per Telegram user at a time, enforced by a per-user Redis lock held under a TTL lease so a crashed worker cannot hold it forever. The global queue is an ingress buffer only; serialization comes from the lock.
+- A worker never blocks waiting on a held lock. When an update arrives for a user whose turn is already in flight, it is not buffered or stacked; the user gets a brief in-game "still acting" notice and the update is dropped.
+- Telegram `update_id` values are idempotency keys stored in `telegram_updates`. A webhook retry for a pending update returns successfully without enqueueing a duplicate; a retry for a completed update re-sends the stored reply payload and never triggers a second LLM call.
+- The worker commits game mutations and the corresponding outbound reply payload in one transaction, then sends the reply to Telegram. If Telegram send fails after commit, retry uses the stored reply payload instead of re-running the LLM.
+- Callback data must stay within Telegram's 64-byte limit; it carries an opaque id referencing a `suggested_actions` row scoped to its game and turn. Callbacks from an earlier turn or game are rejected with a gentle notice.
+- LLM failures must not mutate durable game state.
+- Reducers clamp numeric values to their world-defined bounds and reject or ignore invalid deltas.
+- The locked world bible is read-only after confirmation. No turn-output field can mutate it, and reducers drop any delta targeting locked world content.
+
+## Data Model
+
+Durable tables:
+
+- `players`
+- `games`
+- `npcs`
+- `relationships`
+- `turns`
+- `suggested_actions`
+- `llm_calls`
+- `telegram_updates`: durable inbox/outbox keyed by `update_id`, with `status` (`pending`, `processing`, `completed`, `dropped`, `failed`), raw update payload, optional `game_id`, optional `turn_id`, retry count, error text, `reply_payload`, `telegram_message_id`, and timestamps.
+
+Transient Redis keys:
+
+- `llm_rpg:updates`: update queue
+- `llm_rpg:lock:user:{telegram_user_id}`: per-player lock
+- `llm_rpg:tg_state:{telegram_user_id}`: worldbuilding flow state
+- `llm_rpg:pending_world:{telegram_user_id}`: generated world awaiting confirmation
+
+## Production Behavior
+
+- The webhook endpoint returns quickly after enqueueing updates.
+- The worker sends Telegram typing actions during LLM calls.
+- Per-player Redis locks prevent concurrent state corruption.
+- Invalid model JSON triggers a repair attempt.
+- Provider timeouts and validation failures return a recoverable in-game failure message.
+- Secrets are read from environment variables only.
+- Logs are structured enough to trace update, game, and LLM call failures.
+- Health endpoints expose readiness and basic metrics.
+- Per-user rate limiting caps turn frequency to control cost and abuse. A player has at most one active game at a time; `/new` while a game is active prompts before archiving.
+- Player input and generated narration both pass moderation. A raised safety flag drives a defined response (soften, refuse, or warn), not an advisory note only.
+- Redis holds the queue, locks, and worldbuilding flow state, and is treated as ephemeral. Transient keys carry TTLs, and loss of in-progress worldbuilding state is recoverable by restarting `/new`. Durable game state never lives only in Redis.
+- Admin commands are gated by an allowlist of Telegram user ids from configuration.
+
+## Test Standard
+
+Required coverage:
+
+- World generation schema validation
+- Locked-world behavior
+- NPC persistence and memory updates
+- State reducer bounds
+- Suggested action callback length
+- Telegram message and callback routing
+- Idempotent update handling
+- Provider fallback and repair behavior
+- Docker Compose E2E path from `/new` to three turns
+- A deterministic fake LLM provider used across all tests, including the E2E path, so tests never call a live model
+- In-flight rejection when a user sends an action during an active turn
+- Stale callback rejection across turns and games
+- Context assembly staying within the token budget as game state grows
