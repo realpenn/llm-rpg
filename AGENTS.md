@@ -18,13 +18,19 @@
 
 ## 构建、测试与开发命令
 
-当前尚无可运行工程命令。开始脚手架后，请补充并维护以下命令：
+常用工程命令：
 
+- `uv sync`：安装并同步本地依赖。
 - `docker compose up --build`：启动本地完整服务。
-- `pytest`：运行全部测试。
-- `pytest tests/path/test_file.py -q`：运行单个测试文件。
-- `alembic upgrade head`：应用数据库迁移。
-- `ruff check .` 与 `ruff format .`：如采用 Ruff，用于检查和格式化 Python 代码。
+- `uv run pytest`：运行全部测试。
+- `uv run pytest tests/path/test_file.py -q`：运行单个测试文件。
+- `uv run alembic upgrade head`：应用数据库迁移。
+- `uv run ruff check .`、`uv run ruff format --check .` 与 `uv run ruff format .`：检查和格式化 Python 代码。
+- `uv run python -m llm_rpg.scripts.run_worldbuild "<seed>"`：手动运行世界创建 vertical slice。
+- `uv run python -m llm_rpg.scripts.set_bot_commands`：注册 Telegram bot 命令菜单。
+- `uv run python -m llm_rpg.scripts.set_telegram_webhook`：设置真实 Telegram webhook。
+- `uv run python -m llm_rpg.scripts.delete_telegram_webhook`：切换到 polling 前删除 Telegram webhook。
+- `docker compose --profile e2e run --rm e2e`：在 Compose 容器中运行 FakeTelegram/FakeProvider E2E。
 
 新增命令时，同步更新本文件和 README。
 
