@@ -48,7 +48,7 @@ uv run alembic upgrade head
 - `/world`、`/people`、`/status`、`/inventory`：查看当前游戏状态。
 - `/quota`：查看剩余回合额度。
 - `/recharge <code>`：兑换一次性充值码。
-- `/reset`、`/archive`：归档当前游戏或查看归档。
+- `/reset`、`/archive`、`/restore [编号]`：归档当前游戏、查看归档或恢复最近/指定存档。
 - `/admin_stats`、`/admin_code <10|50|100|unlimited> [数量]`：管理员命令。
 
 ## 真实 Telegram 上线

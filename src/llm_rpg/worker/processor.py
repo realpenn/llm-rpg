@@ -44,6 +44,7 @@ from llm_rpg.worker.lifecycle import (
 logger = logging.getLogger(__name__)
 ModelT = TypeVar("ModelT")
 TYPING_INTERVAL_SECONDS = 4.0
+ARCHIVE_ID_PREFIX_LENGTH = 8
 
 
 @dataclass(slots=True)
@@ -246,6 +247,7 @@ class WorkerProcessor:
             "/quota",
             "/recharge",
             "/reset",
+            "/restore",
         }:
             return await self._handle_command(parsed, session, player, game)
         if game is None:
@@ -325,19 +327,8 @@ class WorkerProcessor:
                 ]
             )
         if parsed.command == "/archive":
-            games = (
-                await session.scalars(
-                    select(Game)
-                    .where(Game.player_id == player.id, Game.archived_at.is_not(None))
-                    .order_by(Game.archived_at.desc())
-                )
-            ).all()
-            if not games:
-                text = "暂无归档游戏。"
-            else:
-                text = "\n".join(
-                    f"- {item.world_bible.get('summary', '未命名世界')}" for item in games
-                )
+            games = await _list_archived_games(session, player)
+            text = _format_archive_list(games)
             return HandledUpdate(
                 reply_payload=[message_payload(chat_id=parsed.telegram_chat_id, text=text)]
             )
@@ -408,6 +399,39 @@ class WorkerProcessor:
                 )
             return HandledUpdate(
                 reply_payload=[message_payload(chat_id=parsed.telegram_chat_id, text=text)]
+            )
+        if parsed.command == "/restore":
+            if game is not None:
+                return HandledUpdate(
+                    reply_payload=[
+                        message_payload(
+                            chat_id=parsed.telegram_chat_id,
+                            text="你已经有一局进行中的游戏。请先 /reset 归档当前游戏后再恢复存档。",
+                        )
+                    ],
+                )
+            restored_game, error_text = await _find_archived_game(
+                session, player, _command_arg(parsed.text)
+            )
+            if restored_game is None:
+                return HandledUpdate(
+                    reply_payload=[
+                        message_payload(
+                            chat_id=parsed.telegram_chat_id,
+                            text=error_text or "暂无可恢复的归档游戏。",
+                        )
+                    ],
+                )
+            restored_game.archived_at = None
+            summary = restored_game.world_bible.get("summary", "未命名世界")
+            return HandledUpdate(
+                reply_payload=[
+                    message_payload(
+                        chat_id=parsed.telegram_chat_id,
+                        text=f"已恢复存档：{summary}\n你可以继续输入行动。",
+                    )
+                ],
+                game_id=restored_game.id,
             )
         if game is None:
             return HandledUpdate(
@@ -582,7 +606,10 @@ def _seed_from_text(text: str | None) -> str:
 
 
 def _help_text() -> str:
-    return "可用命令：/new /world /people /status /inventory /quota /recharge /reset /archive /help"
+    return (
+        "可用命令：/new /world /people /status /inventory /quota /recharge "
+        "/reset /archive /restore /help"
+    )
 
 
 def _command_arg(text: str | None) -> str:
@@ -624,6 +651,49 @@ def _actions_markup(actions: list[Any]) -> dict[str, Any] | None:
             [{"text": action.label, "callback_data": action.callback_id}] for action in actions
         ]
     }
+
+
+async def _list_archived_games(session: AsyncSession, player: Player) -> list[Game]:
+    return list(
+        (
+            await session.scalars(
+                select(Game)
+                .where(Game.player_id == player.id, Game.archived_at.is_not(None))
+                .order_by(Game.archived_at.desc(), Game.created_at.desc())
+            )
+        ).all()
+    )
+
+
+def _format_archive_list(games: list[Game]) -> str:
+    if not games:
+        return "暂无归档游戏。"
+    lines = ["归档游戏："]
+    lines.extend(
+        f"- {item.id[:ARCHIVE_ID_PREFIX_LENGTH]}：{item.world_bible.get('summary', '未命名世界')}"
+        for item in games
+    )
+    lines.append("发送 /restore <编号> 恢复；不带编号会恢复最近的归档。")
+    return "\n".join(lines)
+
+
+async def _find_archived_game(
+    session: AsyncSession,
+    player: Player,
+    selector: str,
+) -> tuple[Game | None, str | None]:
+    games = await _list_archived_games(session, player)
+    if not games:
+        return None, "暂无可恢复的归档游戏。"
+    if not selector:
+        return games[0], None
+
+    matches = [item for item in games if item.id == selector or item.id.startswith(selector)]
+    if not matches:
+        return None, "找不到这个归档游戏。发送 /archive 查看可恢复的存档。"
+    if len(matches) > 1:
+        return None, "匹配到多个归档游戏，请使用更长的存档编号。"
+    return matches[0], None
 
 
 def _dropped_callback(
