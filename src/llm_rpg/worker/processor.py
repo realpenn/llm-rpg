@@ -200,7 +200,7 @@ class WorkerProcessor:
                         )
                     ],
                 )
-            if not has_turn_credit(player):
+            if not await has_turn_credit(session, player):
                 return _quota_exhausted(parsed.telegram_chat_id)
             try:
                 result = await self._with_typing(
@@ -257,6 +257,8 @@ class WorkerProcessor:
                     )
                 ],
             )
+        if not await has_turn_credit(session, player):
+            return _quota_exhausted(parsed.telegram_chat_id, game_id=game.id)
         input_flags: list[SafetyFlagRecord] = []
         if self.moderation_service is not None:
             input_result = await self.moderation_service.moderate_input(parsed.text or "")
@@ -271,9 +273,7 @@ class WorkerProcessor:
                     ],
                     safety_flags=input_flags,
                 )
-        if not has_turn_credit(player):
-            return _quota_exhausted(parsed.telegram_chat_id, game_id=game.id)
-        if not consume_turn_credit(player):
+        if not await consume_turn_credit(session, player):
             return _quota_exhausted(parsed.telegram_chat_id, game_id=game.id)
         result = await self._with_typing(
             parsed.telegram_chat_id,
@@ -499,14 +499,14 @@ class WorkerProcessor:
                 callback_query_id=parsed.callback_query_id,
                 game_id=game.id,
             )
-        if not has_turn_credit(player):
+        if not await has_turn_credit(session, player):
             return _quota_exhausted(
                 parsed.telegram_chat_id,
                 callback_query_id=parsed.callback_query_id,
                 game_id=game.id,
             )
         await self._answer_callback_now(parsed.callback_query_id)
-        if not consume_turn_credit(player):
+        if not await consume_turn_credit(session, player):
             return _quota_exhausted(
                 parsed.telegram_chat_id,
                 callback_query_id=parsed.callback_query_id,

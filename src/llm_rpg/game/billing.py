@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from secrets import choice
 from typing import Literal
 
-from sqlalchemy import select, update
+from sqlalchemy import case, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from llm_rpg.models import Player, RechargeCode
@@ -41,16 +41,33 @@ class RedeemResult:
     unlimited: bool = False
 
 
-def has_turn_credit(player: Player) -> bool:
-    return player.has_unlimited_turns or player.remaining_turns > 0
+async def has_turn_credit(session: AsyncSession, player: Player) -> bool:
+    player_id = await session.scalar(
+        select(Player.id).where(
+            Player.id == player.id,
+            or_(Player.has_unlimited_turns.is_(True), Player.remaining_turns > 0),
+        )
+    )
+    return player_id is not None
 
 
-def consume_turn_credit(player: Player) -> bool:
-    if player.has_unlimited_turns:
-        return True
-    if player.remaining_turns <= 0:
+async def consume_turn_credit(session: AsyncSession, player: Player) -> bool:
+    result = await session.execute(
+        update(Player)
+        .where(
+            Player.id == player.id,
+            or_(Player.has_unlimited_turns.is_(True), Player.remaining_turns > 0),
+        )
+        .values(
+            remaining_turns=case(
+                (Player.has_unlimited_turns.is_(True), Player.remaining_turns),
+                else_=Player.remaining_turns - 1,
+            )
+        )
+    )
+    if result.rowcount != 1:
         return False
-    player.remaining_turns -= 1
+    await session.refresh(player, attribute_names=["remaining_turns", "has_unlimited_turns"])
     return True
 
 
@@ -125,11 +142,17 @@ async def redeem_recharge_code(
         return RedeemResult(status="used")
 
     if recharge_code.unlimited:
-        player.has_unlimited_turns = True
+        await session.execute(
+            update(Player).where(Player.id == player.id).values(has_unlimited_turns=True)
+        )
     else:
-        player.remaining_turns += recharge_code.turn_amount or 0
+        await session.execute(
+            update(Player)
+            .where(Player.id == player.id)
+            .values(remaining_turns=Player.remaining_turns + (recharge_code.turn_amount or 0))
+        )
 
-    await session.flush()
+    await session.refresh(player, attribute_names=["remaining_turns", "has_unlimited_turns"])
     return RedeemResult(
         status="ok",
         turn_amount=recharge_code.turn_amount,

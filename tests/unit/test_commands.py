@@ -226,6 +226,45 @@ async def test_new_game_requires_quota_before_calling_provider() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exhausted_quota_skips_input_moderation() -> None:
+    class ModerationProbe:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def moderate_input(self, text: str):  # noqa: ANN202
+            del text
+            self.called = True
+            raise AssertionError("moderation should not run when quota is exhausted")
+
+    session_factory = await _session_factory()
+    sender = Sender()
+    moderation = ModerationProbe()
+    async with session_factory() as session:
+        async with session.begin():
+            game = await _seed_active_game(session)
+            game.player.remaining_turns = 0
+            await record_telegram_update(session, _message_update(41, "我检查门口"))
+
+    worker = WorkerProcessor(
+        session_factory=session_factory,
+        provider=FakeProvider(),
+        sender=sender,
+        settings=Settings(),
+        moderation_service=moderation,
+    )
+    await worker.process_update_id(41)
+
+    async with session_factory() as session:
+        update = await session.get(TelegramUpdate, 41)
+
+    assert not moderation.called
+    assert update is not None
+    assert update.status == UpdateStatus.DROPPED
+    assert update.drop_reason == DropReason.QUOTA_EXHAUSTED
+    assert sender.messages[0]["text"] == "剩余额度不足。请使用 /recharge <充值码> 充值后继续。"
+
+
+@pytest.mark.asyncio
 async def test_admin_generates_recharge_code_and_player_redeems_once() -> None:
     session_factory = await _session_factory()
     sender = Sender()
