@@ -112,6 +112,135 @@ async def test_reset_archives_active_game_and_archive_lists_summary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_restore_latest_archived_game_makes_it_active() -> None:
+    session_factory = await _session_factory()
+    sender = Sender()
+    async with session_factory() as session:
+        async with session.begin():
+            await _seed_active_game(session)
+            await record_telegram_update(session, _message_update(13, "/reset"))
+
+    worker = WorkerProcessor(
+        session_factory=session_factory,
+        provider=FakeProvider(),
+        sender=sender,
+        settings=Settings(),
+    )
+    await worker.process_update_id(13)
+
+    async with session_factory() as session:
+        async with session.begin():
+            await record_telegram_update(session, _message_update(14, "/restore"))
+            await record_telegram_update(session, _message_update(15, "/world"))
+
+    for update_id in [14, 15]:
+        await worker.process_update_id(update_id)
+
+    async with session_factory() as session:
+        game = await session.scalar(select(Game))
+        actions = (await session.scalars(select(SuggestedAction))).all()
+        restore_update = await session.get(TelegramUpdate, 14)
+
+    assert game is not None
+    assert game.archived_at is None
+    assert actions == []
+    assert restore_update is not None
+    assert restore_update.game_id == game.id
+    assert sender.messages[0]["text"] == "当前游戏已归档。"
+    assert sender.messages[1]["text"] == "已恢复存档：旧城被雨困住。\n你可以继续输入行动。"
+    assert sender.messages[2]["text"] == "旧城被雨困住。"
+
+
+@pytest.mark.asyncio
+async def test_restore_accepts_archive_id_prefix() -> None:
+    session_factory = await _session_factory()
+    sender = Sender()
+    async with session_factory() as session:
+        async with session.begin():
+            player = Player(telegram_user_id=42)
+            older = Game(
+                player=player,
+                world_bible={"summary": "旧档案馆。"},
+                player_state={"location": "archive", "vitals": {}},
+                rolling_summary="",
+                turn_number=0,
+                archived_at=datetime(2024, 1, 1, tzinfo=UTC),
+            )
+            newer = Game(
+                player=player,
+                world_bible={"summary": "新雨城。"},
+                player_state={"location": "rain_city", "vitals": {}},
+                rolling_summary="",
+                turn_number=0,
+                archived_at=datetime(2024, 1, 2, tzinfo=UTC),
+            )
+            session.add_all([player, older, newer])
+            await session.flush()
+            await record_telegram_update(session, _message_update(16, f"/restore {older.id[:8]}"))
+
+    worker = WorkerProcessor(
+        session_factory=session_factory,
+        provider=FakeProvider(),
+        sender=sender,
+        settings=Settings(),
+    )
+    await worker.process_update_id(16)
+
+    async with session_factory() as session:
+        older = await session.get(Game, older.id)
+        newer = await session.get(Game, newer.id)
+
+    assert older is not None
+    assert newer is not None
+    assert older.archived_at is None
+    assert newer.archived_at is not None
+    assert sender.messages[0]["text"] == "已恢复存档：旧档案馆。\n你可以继续输入行动。"
+
+
+@pytest.mark.asyncio
+async def test_restore_refuses_when_active_game_exists() -> None:
+    session_factory = await _session_factory()
+    sender = Sender()
+    async with session_factory() as session:
+        async with session.begin():
+            active = await _seed_active_game(session)
+            archived = Game(
+                player_id=active.player_id,
+                world_bible={"summary": "另一座城。"},
+                player_state={"location": "other_city", "vitals": {}},
+                rolling_summary="",
+                turn_number=0,
+                archived_at=datetime.now(UTC),
+            )
+            session.add(archived)
+            await session.flush()
+            await record_telegram_update(
+                session, _message_update(17, f"/restore {archived.id[:8]}")
+            )
+
+    worker = WorkerProcessor(
+        session_factory=session_factory,
+        provider=FakeProvider(),
+        sender=sender,
+        settings=Settings(),
+    )
+    await worker.process_update_id(17)
+
+    async with session_factory() as session:
+        active = await session.get(Game, active.id)
+        archived = await session.get(Game, archived.id)
+
+    assert active is not None
+    assert archived is not None
+    assert active.archived_at is None
+    assert archived.archived_at is not None
+    assert (
+        sender.messages[0]["text"]
+        == "你已经有一局进行中的游戏。请先 /reset 归档当前游戏后再恢复存档。"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stale_callback_is_dropped() -> None:
     session_factory = await _session_factory()
     sender = Sender()

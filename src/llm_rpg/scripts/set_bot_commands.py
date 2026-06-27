@@ -16,6 +16,7 @@ COMMANDS = [
     {"command": "recharge", "description": "使用充值码"},
     {"command": "reset", "description": "归档当前游戏"},
     {"command": "archive", "description": "查看归档"},
+    {"command": "restore", "description": "恢复归档游戏"},
     {"command": "help", "description": "查看帮助"},
     {"command": "admin_code", "description": "管理员生成充值码"},
 ]
