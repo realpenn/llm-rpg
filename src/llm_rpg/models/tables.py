@@ -39,8 +39,32 @@ class Player(TimestampMixin, Base):
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
     username: Mapped[str | None] = mapped_column(String(255))
     display_name: Mapped[str | None] = mapped_column(String(255))
+    remaining_turns: Mapped[int] = mapped_column(
+        Integer, default=10, server_default="10", nullable=False
+    )
+    has_unlimited_turns: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
 
     games: Mapped[list["Game"]] = relationship(back_populates="player")
+
+
+class RechargeCode(TimestampMixin, Base):
+    __tablename__ = "recharge_codes"
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_recharge_codes_code"),
+        Index("ix_recharge_codes_used_at", "used_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    code: Mapped[str] = mapped_column(String(40), nullable=False)
+    turn_amount: Mapped[int | None] = mapped_column(Integer)
+    unlimited: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_by_telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    used_by_player_id: Mapped[str | None] = mapped_column(
+        ForeignKey("players.id", ondelete="SET NULL")
+    )
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Game(TimestampMixin, Base):

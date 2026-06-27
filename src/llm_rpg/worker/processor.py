@@ -10,6 +10,17 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from llm_rpg.config import Settings, get_settings
+from llm_rpg.game.billing import (
+    MAX_ADMIN_CODE_BATCH,
+    RechargePackage,
+    consume_turn_credit,
+    create_recharge_codes,
+    format_player_quota,
+    has_turn_credit,
+    normalize_recharge_package,
+    recharge_package_label,
+    redeem_recharge_code,
+)
 from llm_rpg.game.maintenance import archive_game
 from llm_rpg.game.moderation import ModerationService
 from llm_rpg.game.turn import process_player_turn
@@ -178,6 +189,19 @@ class WorkerProcessor:
         if parsed.command == "/new":
             seed = _seed_from_text(parsed.text)
             player = await get_or_create_player(session, telegram_user_id=parsed.telegram_user_id)
+            existing = await session.scalar(
+                select(Game).where(Game.player_id == player.id, Game.archived_at.is_(None))
+            )
+            if existing is not None:
+                return HandledUpdate(
+                    reply_payload=[
+                        message_payload(
+                            chat_id=parsed.telegram_chat_id, text="你已经有一局进行中的游戏。"
+                        )
+                    ],
+                )
+            if not await has_turn_credit(session, player):
+                return _quota_exhausted(parsed.telegram_chat_id)
             try:
                 result = await self._with_typing(
                     parsed.telegram_chat_id,
@@ -218,6 +242,9 @@ class WorkerProcessor:
             "/inventory",
             "/archive",
             "/admin_stats",
+            "/admin_code",
+            "/quota",
+            "/recharge",
             "/reset",
         }:
             return await self._handle_command(parsed, session, player, game)
@@ -230,6 +257,8 @@ class WorkerProcessor:
                     )
                 ],
             )
+        if not await has_turn_credit(session, player):
+            return _quota_exhausted(parsed.telegram_chat_id, game_id=game.id)
         input_flags: list[SafetyFlagRecord] = []
         if self.moderation_service is not None:
             input_result = await self.moderation_service.moderate_input(parsed.text or "")
@@ -244,6 +273,8 @@ class WorkerProcessor:
                     ],
                     safety_flags=input_flags,
                 )
+        if not await consume_turn_credit(session, player):
+            return _quota_exhausted(parsed.telegram_chat_id, game_id=game.id)
         result = await self._with_typing(
             parsed.telegram_chat_id,
             process_player_turn(
@@ -306,6 +337,74 @@ class WorkerProcessor:
             else:
                 text = "\n".join(
                     f"- {item.world_bible.get('summary', '未命名世界')}" for item in games
+                )
+            return HandledUpdate(
+                reply_payload=[message_payload(chat_id=parsed.telegram_chat_id, text=text)]
+            )
+        if parsed.command == "/admin_code":
+            if parsed.telegram_user_id not in self.settings.admin_user_ids:
+                return HandledUpdate(
+                    reply_payload=[
+                        message_payload(chat_id=parsed.telegram_chat_id, text="无权访问。")
+                    ]
+                )
+            package, count, error_text = _parse_admin_code_args(parsed.text)
+            if error_text is not None or package is None or count is None:
+                return HandledUpdate(
+                    reply_payload=[
+                        message_payload(
+                            chat_id=parsed.telegram_chat_id,
+                            text=error_text or _admin_code_usage(),
+                        )
+                    ]
+                )
+            codes = await create_recharge_codes(
+                session,
+                package=package,
+                count=count,
+                created_by_telegram_user_id=parsed.telegram_user_id,
+            )
+            label = recharge_package_label(package)
+            code_lines = "\n".join(code.code for code in codes)
+            return HandledUpdate(
+                reply_payload=[
+                    message_payload(
+                        chat_id=parsed.telegram_chat_id,
+                        text=f"已生成 {count} 个{label}充值码：\n{code_lines}",
+                    )
+                ]
+            )
+        if parsed.command == "/quota":
+            return HandledUpdate(
+                reply_payload=[
+                    message_payload(
+                        chat_id=parsed.telegram_chat_id,
+                        text=f"当前剩余额度：{format_player_quota(player)}。",
+                    )
+                ]
+            )
+        if parsed.command == "/recharge":
+            raw_code = _command_arg(parsed.text)
+            if not raw_code:
+                return HandledUpdate(
+                    reply_payload=[
+                        message_payload(
+                            chat_id=parsed.telegram_chat_id,
+                            text="用法：/recharge <充值码>",
+                        )
+                    ]
+                )
+            result = await redeem_recharge_code(session, player=player, raw_code=raw_code)
+            if result.status == "invalid":
+                text = "充值码无效。"
+            elif result.status == "used":
+                text = "这个充值码已经被使用。"
+            elif result.unlimited:
+                text = "充值成功，已解锁无限回合。"
+            else:
+                text = (
+                    f"充值成功，增加 {result.turn_amount} 回合。"
+                    f"当前剩余额度：{format_player_quota(player)}。"
                 )
             return HandledUpdate(
                 reply_payload=[message_payload(chat_id=parsed.telegram_chat_id, text=text)]
@@ -392,7 +491,27 @@ class WorkerProcessor:
                 callback_query_id=parsed.callback_query_id,
                 game_id=game.id,
             )
+        player = await session.get(Player, game.player_id)
+        if player is None:
+            return _dropped_callback(
+                parsed.telegram_chat_id,
+                DropReason.OTHER,
+                callback_query_id=parsed.callback_query_id,
+                game_id=game.id,
+            )
+        if not await has_turn_credit(session, player):
+            return _quota_exhausted(
+                parsed.telegram_chat_id,
+                callback_query_id=parsed.callback_query_id,
+                game_id=game.id,
+            )
         await self._answer_callback_now(parsed.callback_query_id)
+        if not await consume_turn_credit(session, player):
+            return _quota_exhausted(
+                parsed.telegram_chat_id,
+                callback_query_id=parsed.callback_query_id,
+                game_id=game.id,
+            )
         result = await self._with_typing(
             parsed.telegram_chat_id,
             process_player_turn(
@@ -463,7 +582,38 @@ def _seed_from_text(text: str | None) -> str:
 
 
 def _help_text() -> str:
-    return "可用命令：/new /world /people /status /inventory /reset /archive /help"
+    return "可用命令：/new /world /people /status /inventory /quota /recharge /reset /archive /help"
+
+
+def _command_arg(text: str | None) -> str:
+    if not text:
+        return ""
+    parts = text.split(maxsplit=1)
+    return parts[1].strip() if len(parts) == 2 else ""
+
+
+def _admin_code_usage() -> str:
+    return f"用法：/admin_code <10|50|100|unlimited> [数量，1-{MAX_ADMIN_CODE_BATCH}]"
+
+
+def _parse_admin_code_args(
+    text: str | None,
+) -> tuple[RechargePackage | None, int | None, str | None]:
+    parts = (text or "").split()
+    if len(parts) < 2 or len(parts) > 3:
+        return None, None, _admin_code_usage()
+    package = normalize_recharge_package(parts[1])
+    if package is None:
+        return None, None, _admin_code_usage()
+    count = 1
+    if len(parts) == 3:
+        try:
+            count = int(parts[2])
+        except ValueError:
+            return None, None, _admin_code_usage()
+    if count < 1 or count > MAX_ADMIN_CODE_BATCH:
+        return None, None, _admin_code_usage()
+    return package, count, None
 
 
 def _actions_markup(actions: list[Any]) -> dict[str, Any] | None:
@@ -483,7 +633,12 @@ def _dropped_callback(
     callback_query_id: str | None = None,
     game_id: str | None = None,
 ) -> HandledUpdate:
-    text = "这个选项已经过期。" if reason == DropReason.STALE_CALLBACK else "这局游戏已归档。"
+    if reason == DropReason.STALE_CALLBACK:
+        text = "这个选项已经过期。"
+    elif reason == DropReason.ARCHIVED_GAME:
+        text = "这局游戏已归档。"
+    else:
+        text = "这个操作暂时不能继续。"
     payload = []
     if callback_query_id:
         payload.append(answer_callback_payload(callback_query_id=callback_query_id, text=text))
@@ -493,4 +648,25 @@ def _dropped_callback(
         game_id=game_id,
         status=UpdateStatus.DROPPED,
         drop_reason=reason,
+    )
+
+
+def _quota_exhausted(
+    chat_id: int,
+    *,
+    callback_query_id: str | None = None,
+    game_id: str | None = None,
+) -> HandledUpdate:
+    text = "剩余额度不足。请使用 /recharge <充值码> 充值后继续。"
+    payload = []
+    if callback_query_id:
+        payload.append(
+            answer_callback_payload(callback_query_id=callback_query_id, text=text, show_alert=True)
+        )
+    payload.append(message_payload(chat_id=chat_id, text=text))
+    return HandledUpdate(
+        reply_payload=payload,
+        game_id=game_id,
+        status=UpdateStatus.DROPPED,
+        drop_reason=DropReason.QUOTA_EXHAUSTED,
     )

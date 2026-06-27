@@ -1,11 +1,14 @@
 from dataclasses import dataclass
 
 READ_ONLY_COMMANDS = {
+    "/admin_code",
     "/admin_stats",
     "/archive",
     "/help",
     "/inventory",
     "/people",
+    "/quota",
+    "/recharge",
     "/start",
     "/status",
     "/world",
