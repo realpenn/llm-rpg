@@ -8,7 +8,16 @@ from sqlalchemy.pool import StaticPool
 from llm_rpg.config import Settings
 from llm_rpg.db import Base
 from llm_rpg.llm import FakeProvider
-from llm_rpg.models import Game, LlmCall, Npc, Player, SuggestedAction, TelegramUpdate, Turn
+from llm_rpg.models import (
+    Game,
+    LlmCall,
+    Npc,
+    Player,
+    RechargeCode,
+    SuggestedAction,
+    TelegramUpdate,
+    Turn,
+)
 from llm_rpg.schemas.enums import DropReason, UpdateStatus
 from llm_rpg.worker import WorkerProcessor, record_telegram_update
 
@@ -184,6 +193,116 @@ async def test_archived_game_callback_is_rejected() -> None:
     assert update.status == UpdateStatus.DROPPED
     assert update.drop_reason == DropReason.ARCHIVED_GAME
     assert sender.messages[0]["text"] == "这局游戏已归档。"
+
+
+@pytest.mark.asyncio
+async def test_new_game_requires_quota_before_calling_provider() -> None:
+    session_factory = await _session_factory()
+    sender = Sender()
+    provider = FakeProvider()
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(Player(telegram_user_id=42, remaining_turns=0))
+            await record_telegram_update(session, _message_update(40, "/new 旧城雨夜"))
+
+    worker = WorkerProcessor(
+        session_factory=session_factory,
+        provider=provider,
+        sender=sender,
+        settings=Settings(),
+    )
+    await worker.process_update_id(40)
+
+    async with session_factory() as session:
+        update = await session.get(TelegramUpdate, 40)
+        game = await session.scalar(select(Game))
+
+    assert provider.calls == []
+    assert game is None
+    assert update is not None
+    assert update.status == UpdateStatus.DROPPED
+    assert update.drop_reason == DropReason.QUOTA_EXHAUSTED
+    assert sender.messages[0]["text"] == "剩余额度不足。请使用 /recharge <充值码> 充值后继续。"
+
+
+@pytest.mark.asyncio
+async def test_admin_generates_recharge_code_and_player_redeems_once() -> None:
+    session_factory = await _session_factory()
+    sender = Sender()
+    worker = WorkerProcessor(
+        session_factory=session_factory,
+        provider=FakeProvider(),
+        sender=sender,
+        settings=Settings(admin_user_ids=[42]),
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await record_telegram_update(session, _message_update(50, "/admin_code 10 2"))
+    await worker.process_update_id(50)
+
+    async with session_factory() as session:
+        codes = (await session.scalars(select(RechargeCode).order_by(RechargeCode.code))).all()
+    assert len(codes) == 2
+    assert {code.turn_amount for code in codes} == {10}
+    assert all(not code.unlimited for code in codes)
+    assert sender.messages[0]["text"].startswith("已生成 2 个10 回合充值码：")
+
+    code = codes[0].code
+    async with session_factory() as session:
+        async with session.begin():
+            await record_telegram_update(session, _message_update(51, f"/recharge {code}"))
+            await record_telegram_update(session, _message_update(52, f"/recharge {code}"))
+    await worker.process_update_id(51)
+    await worker.process_update_id(52)
+
+    async with session_factory() as session:
+        player = await session.scalar(select(Player).where(Player.telegram_user_id == 42))
+        used_code = await session.scalar(select(RechargeCode).where(RechargeCode.code == code))
+
+    assert player is not None
+    assert player.remaining_turns == 20
+    assert used_code is not None
+    assert used_code.used_by_player_id == player.id
+    assert used_code.used_at is not None
+    assert sender.messages[1]["text"] == "充值成功，增加 10 回合。当前剩余额度：20 回合。"
+    assert sender.messages[2]["text"] == "这个充值码已经被使用。"
+
+
+@pytest.mark.asyncio
+async def test_unlimited_recharge_code_sets_unlimited_quota() -> None:
+    session_factory = await _session_factory()
+    sender = Sender()
+    worker = WorkerProcessor(
+        session_factory=session_factory,
+        provider=FakeProvider(),
+        sender=sender,
+        settings=Settings(admin_user_ids=[42]),
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await record_telegram_update(session, _message_update(60, "/admin_code unlimited"))
+    await worker.process_update_id(60)
+
+    async with session_factory() as session:
+        code = await session.scalar(select(RechargeCode))
+    assert code is not None
+    assert code.unlimited
+    assert code.turn_amount is None
+
+    async with session_factory() as session:
+        async with session.begin():
+            await record_telegram_update(session, _message_update(61, f"/recharge {code.code}"))
+            await record_telegram_update(session, _message_update(62, "/quota"))
+    await worker.process_update_id(61)
+    await worker.process_update_id(62)
+
+    async with session_factory() as session:
+        player = await session.scalar(select(Player).where(Player.telegram_user_id == 42))
+
+    assert player is not None
+    assert player.has_unlimited_turns
+    assert sender.messages[1]["text"] == "充值成功，已解锁无限回合。"
+    assert sender.messages[2]["text"] == "当前剩余额度：无限回合。"
 
 
 async def _session_factory() -> async_sessionmaker:

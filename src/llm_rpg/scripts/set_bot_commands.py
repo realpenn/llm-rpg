@@ -12,9 +12,12 @@ COMMANDS = [
     {"command": "people", "description": "查看已知人物"},
     {"command": "status", "description": "查看状态"},
     {"command": "inventory", "description": "查看背包"},
+    {"command": "quota", "description": "查看剩余额度"},
+    {"command": "recharge", "description": "使用充值码"},
     {"command": "reset", "description": "归档当前游戏"},
     {"command": "archive", "description": "查看归档"},
     {"command": "help", "description": "查看帮助"},
+    {"command": "admin_code", "description": "管理员生成充值码"},
 ]
 
 

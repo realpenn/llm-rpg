@@ -41,6 +41,16 @@ uv run alembic upgrade head
 
 当前已具备健康检查、Redis 队列 worker、领域 schema、持久化模型、LLM provider、世界创建 vertical slice、回合管线、moderation、恢复清理和主要 Telegram 命令。
 
+## Telegram 命令
+
+- `/start`、`/help`：查看入口和帮助。
+- `/new`、`/worlds`：创建新游戏或查看世界预设；`/new` 需要玩家仍有回合额度。
+- `/world`、`/people`、`/status`、`/inventory`：查看当前游戏状态。
+- `/quota`：查看剩余回合额度。
+- `/recharge <code>`：兑换一次性充值码。
+- `/reset`、`/archive`：归档当前游戏或查看归档。
+- `/admin_stats`、`/admin_code <10|50|100|unlimited> [数量]`：管理员命令。
+
 ## 真实 Telegram 上线
 
 1. 通过 BotFather 创建 bot，把 `TELEGRAM_BOT_TOKEN` 写入本机 `.env`。

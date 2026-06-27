@@ -8,7 +8,7 @@ from sqlalchemy import select
 from llm_rpg.api.main import create_app
 from llm_rpg.config import Settings
 from llm_rpg.llm import FakeProvider, StructuredOutputError
-from llm_rpg.models import Game, TelegramUpdate
+from llm_rpg.models import Game, Player, TelegramUpdate
 from llm_rpg.schemas.enums import DropReason, UpdateStatus
 from llm_rpg.worker import WorkerProcessor, record_telegram_update
 
@@ -249,12 +249,15 @@ async def test_new_game_to_three_turns_with_fake_provider(
 
     async with session_factory() as session:
         game = await session.scalar(select(Game))
+        player = await session.scalar(select(Player).where(Player.telegram_user_id == 42))
         updates = (
             await session.scalars(select(TelegramUpdate).order_by(TelegramUpdate.update_id))
         ).all()
 
     assert game is not None
+    assert player is not None
     assert game.turn_number == 3
+    assert player.remaining_turns == 7
     assert game.player_state["vitals"]["hp"] == 5
     assert [update.status for update in updates] == [UpdateStatus.COMPLETED] * 4
     assert len(fake_telegram.messages) == 4

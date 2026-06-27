@@ -80,10 +80,13 @@ NPCs can:
 - `/people`: show known persistent NPCs.
 - `/status`: show current player state.
 - `/inventory`: show inventory.
+- `/quota`: show the player's remaining paid/free turn quota.
+- `/recharge <code>`: redeem a one-time recharge code.
 - `/reset`: archive current game and start over; asks for confirmation if a game is active.
 - `/archive`: list the player's archived games and read-only summaries.
 - `/help`: show commands.
 - `/admin_stats`: admin-only operational stats.
+- `/admin_code <10|50|100|unlimited> [count]`: admin-only recharge code generation.
 
 ### Archive Semantics
 
@@ -231,19 +234,22 @@ NPC fields are defined canonically in Persistent NPCs and are persisted in the `
 - On acquiring a user's lock, the worker handles that user's lowest pending turn-producing `update_id` — not necessarily the update it popped — so a user's actions are processed in Telegram order even across multiple workers.
 - A worker never blocks on a held lock. Turn-producing updates are not buffered or stacked: when update N is claimed for processing, the same transaction marks any other pending turn-producing updates for that user with a higher `update_id` as `dropped` with `blocked_by_update_id=N`; any turn-producing update that arrives while a user's row is already `processing` is inserted directly as `dropped` with the same field. The user gets a brief in-game "still acting" notice. A re-enqueued duplicate of the update already in flight (same `update_id`) is recognized by its status and skipped as a no-op, never re-dropped or re-notified.
 - Per-user rate limiting is enforced at the worker lock boundary after the user lock is acquired and before any LLM turn call. A turn in flight drops competing turn-producing updates with `drop_reason=in_flight`; a configurable sliding-window turns-per-minute cap drops fast-typing floods with `drop_reason=rate_limited`. Both paths use the same `reply_payload` delivery mechanism so dropped notices stay consistent.
-- Non-turn-producing updates such as read-only commands (`/status`, `/people`, `/world`, `/inventory`, `/archive`) and archived-view callbacks are still recorded in `telegram_updates`, but bypass the turn lock, turn ordering, and turn rate limit. They read the latest committed state and reply from that snapshot. They must not call the turn LLM or mutate game state.
+- Non-turn-producing updates such as status/account commands (`/status`, `/people`, `/world`, `/inventory`, `/archive`, `/quota`, `/recharge`, and admin commands) and archived-view callbacks are still recorded in `telegram_updates`, but bypass the turn lock, turn ordering, and turn rate limit. They read or update only the latest committed non-gameplay account state and must not call the turn LLM.
 - Telegram `update_id` values are idempotency keys stored in `telegram_updates`. The inbox row, not the Redis queue, is the source of truth. A webhook retry never creates a duplicate row: for a `pending` or `processing` update it ensures the update is enqueued (re-enqueue is idempotent — the worker dedupes by status and the per-user lock) and returns; for a terminal update with a `reply_payload`, it re-sends the stored reply and never triggers a second LLM call. The time-sensitive `dropped` notice is re-sent only by such near-immediate webhook retries, never by the later reconciler (see Update Lifecycle).
 - The worker commits game mutations and the outbound reply payload in one transaction (`processing` → `completed`) only if its `lease_owner` and `lease_token` still match the row. It then sends the reply to Telegram and records the delivered `telegram_message_ids`. Sending is always driven from the stored reply payload, never by re-running the LLM, so any retry — in-process, from webhook retry, or by the reconciler — reuses it.
 - Callback data must stay within Telegram's 64-byte limit; it carries an opaque id referencing a `suggested_actions` row scoped to its game and turn. Callbacks from an earlier turn or game are rejected with a gentle notice.
 - LLM failures must not mutate durable game state.
 - Reducers apply the State Delta Protocol, clamp numeric values to their world-defined bounds, and audit accepted, adjusted, and dropped deltas.
 - The locked world bible is read-only after confirmation. No turn-output field can mutate it, and reducers drop any delta targeting locked world content.
+- Player quota is checked before any user-triggered LLM gameplay cost. `/new` requires positive remaining quota or unlimited status before worldbuilding, but does not consume a turn itself. Successful natural-language player actions and valid current suggested-action callbacks consume one turn inside the same database transaction as the resulting game mutation; if the provider fails and the transaction rolls back, the quota decrement rolls back too. Read-only/status commands, recharge commands, admin commands, stale callbacks, and refused input moderation do not consume quota.
+- Recharge codes are single-use. Redeeming a finite code adds its turn amount to `players.remaining_turns`; redeeming an unlimited code sets `players.has_unlimited_turns`. Admin code generation is gated by the same admin allowlist as other admin commands.
 
 ## Data Model
 
 Durable tables:
 
-- `players`
+- `players`: Telegram player account records, including remaining finite turn quota and whether the account has unlimited turns. New players receive 10 free turns.
+- `recharge_codes`: one-time recharge codes generated by admins. Codes are either 10-turn, 50-turn, 100-turn, or unlimited packages, and store their creator, redemption player, and redemption timestamp.
 - `games`: per-player game holding the locked `WorldBible`, the current `PlayerState` snapshot, the rolling game summary, `turn_number`, optional time-of-day tag, and active/archived status (at most one active per player).
 - `factions`: faction entities materialized from the locked `WorldBible` at confirmation, keyed and scoped to the game. Holds each faction's static identity (key, name, description, ideology) plus a dynamic `memory_log`; identity is read-only after confirmation, while dynamic standing lives in `relationships`. Referenced by `npcs.faction` and by relationship edges via faction key.
 - `npcs`
@@ -252,7 +258,7 @@ Durable tables:
 - `events`: durable event log entries produced by turns, scoped to the game and indexed by location, involved entities, and recency so context assembly can recall the relevant ones.
 - `suggested_actions`: rows scoped to `(game_id, turn_id)` with an opaque callback id. Retention is bounded: rows older than the last K turns of the active game are hard-deleted by a periodic sweeper. Missing action ids are treated as stale with a gentle notice. On game archive, all suggested actions for that game are deleted; callbacks referencing an archived game are rejected at game-state lookup.
 - `llm_calls`: scoped to `(game_id, turn_id)` where applicable, with purpose (`world_build`, `turn`, `repair`, `resummarize`, `moderation`, `soften_rewrite`), provider, model, `mode_used` (`strict`, `json_object`, `repair`), request messages or hash, raw response text, parsed payload when valid, token counts, latency, outcome (`ok`, `schema_invalid`, `provider_timeout`, `repair_failed`, `moderation_blocked`), `delta_dropped` summary for turn calls, error text, and timestamp. Retention is bounded per game, and rows are deleted on archive.
-- `telegram_updates`: durable inbox/outbox keyed by `update_id`, with `telegram_user_id`, `telegram_chat_id`, update kind, turn-producing flag, `status` (`pending`, `processing`, `completed`, `dropped`, `failed`), `drop_reason` (`in_flight`, `rate_limited`, `stale_callback`, `archived_game`, `duplicate`, or `other`), `blocked_by_update_id` for in-flight drops, `lease_owner`, `lease_token`, `lease_expires_at`, `next_retry_at`, raw update payload, optional `game_id`, optional `turn_id`, `retry_count`, error text, an ordered `reply_payload` (one or more outbound messages), the delivered `telegram_message_ids`, and timestamps.
+- `telegram_updates`: durable inbox/outbox keyed by `update_id`, with `telegram_user_id`, `telegram_chat_id`, update kind, turn-producing flag, `status` (`pending`, `processing`, `completed`, `dropped`, `failed`), `drop_reason` (`in_flight`, `rate_limited`, `quota_exhausted`, `stale_callback`, `archived_game`, `duplicate`, or `other`), `blocked_by_update_id` for in-flight drops, `lease_owner`, `lease_token`, `lease_expires_at`, `next_retry_at`, raw update payload, optional `game_id`, optional `turn_id`, `retry_count`, error text, an ordered `reply_payload` (one or more outbound messages), the delivered `telegram_message_ids`, and timestamps.
 
 Faction membership model: an NPC's current allegiance is stored only on `npcs.faction`. `relationships` edges carry standing toward a faction, never authoritative membership.
 
@@ -301,6 +307,7 @@ A turn may emit more than one outbound message. For `completed` and `failed` row
 - Moderation follows the Moderation Pipeline and always records the final action taken.
 - Redis holds the queue, locks, and worldbuilding flow state, and is treated as ephemeral. Transient keys carry TTLs, and loss of in-progress worldbuilding state is recoverable by restarting `/new`. Durable game state never lives only in Redis.
 - Admin commands are gated by an allowlist of Telegram user ids from configuration.
+- New accounts can play 10 turns for free. After the quota is exhausted, `/new`, natural-language actions, and valid action callbacks are rejected with a recharge prompt until the player redeems a recharge code or has unlimited turns.
 
 ## Test Standard
 
@@ -330,6 +337,7 @@ Required coverage:
 - Game clock persistence on games and turn snapshots; `time_advance` updating only the in-world time tag
 - Relationship `edge_type` validation and faction membership changes via `npcs.faction`
 - Rate-limit drops at the worker lock boundary with `drop_reason=rate_limited`
+- Player quota defaults, `/new` quota validation without consuming quota, successful turn quota consumption, exhausted-quota drops, one-time recharge-code redemption, unlimited-code redemption, and admin-only code generation
 - Processing retry backoff with `next_retry_at` and heartbeat-held lease
 - Reconciler re-enqueues orphaned `pending` rows after a lost enqueue or flushed queue
 - Reclaim of an expired `processing` lease without double-processing a slow-but-alive worker, including `lease_owner`/`lease_token` compare-and-set preventing stale commits

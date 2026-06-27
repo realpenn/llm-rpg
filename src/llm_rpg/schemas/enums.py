@@ -12,6 +12,7 @@ class UpdateStatus(StrEnum):
 class DropReason(StrEnum):
     IN_FLIGHT = "in_flight"
     RATE_LIMITED = "rate_limited"
+    QUOTA_EXHAUSTED = "quota_exhausted"
     STALE_CALLBACK = "stale_callback"
     ARCHIVED_GAME = "archived_game"
     DUPLICATE = "duplicate"
