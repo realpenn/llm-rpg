@@ -46,7 +46,7 @@
 
 仓库目前没有提交历史；在形成项目惯例前，使用 Conventional Commits，例如 `feat: add world builder schema`、`test: cover update idempotency`。
 
-所有修改应以 Pull Request 形式提交，PR 标题不加任何前缀。PR 应包含变更摘要、关联 issue 或任务、测试结果、迁移说明，以及 Telegram 交互相关的 transcript 片段。凡涉及环境变量、数据模型、提示词或 LLM provider 假设的变化，都必须明确说明。
+所有修改应以 Pull Request 形式提交，PR 标题不加任何前缀。PR 应包含变更摘要、关联 issue 或任务、测试结果、迁移说明，以及 Telegram 交互相关的 transcript 片段。凡涉及环境变量、数据模型、提示词或 LLM provider 假设的变化，都必须明确说明。分支不加任何前缀。
 
 ## Agent 专用说明
 
