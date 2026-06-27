@@ -45,6 +45,48 @@ logger = logging.getLogger(__name__)
 ModelT = TypeVar("ModelT")
 TYPING_INTERVAL_SECONDS = 4.0
 ARCHIVE_ID_PREFIX_LENGTH = 8
+NEW_PRESET_CALLBACK_PREFIX = "new:"
+
+
+@dataclass(frozen=True, slots=True)
+class NewGamePreset:
+    key: str
+    label: str
+    seed: str
+
+
+NEW_GAME_PRESETS = [
+    NewGamePreset(
+        key="mystery",
+        label="悬疑",
+        seed="一个中文文字 RPG 悬疑世界：旧城、谜案、隐秘组织、层层反转，但保持可推理。",
+    ),
+    NewGamePreset(
+        key="horror",
+        label="恐怖",
+        seed="一个中文文字 RPG 恐怖世界：压迫氛围、未知威胁、心理惊悚和生存选择。",
+    ),
+    NewGamePreset(
+        key="romance",
+        label="恋爱",
+        seed="一个中文文字 RPG 恋爱世界：情感关系、误会与选择、细腻互动和成长。",
+    ),
+    NewGamePreset(
+        key="urban",
+        label="都市",
+        seed="一个中文文字 RPG 都市世界：现代城市、职场与街区、人际网络和隐藏事件。",
+    ),
+    NewGamePreset(
+        key="xianxia",
+        label="修仙",
+        seed="一个中文文字 RPG 修仙世界：宗门、灵根、秘境、因果和境界突破。",
+    ),
+    NewGamePreset(
+        key="scifi",
+        label="科幻",
+        seed="一个中文文字 RPG 科幻世界：星际边境、人工智能、殖民地危机和技术伦理。",
+    ),
+]
 
 
 @dataclass(slots=True)
@@ -183,7 +225,8 @@ class WorkerProcessor:
                 reply_payload=[
                     message_payload(
                         chat_id=parsed.telegram_chat_id,
-                        text="可选世界：默认悬疑旧城；也可以发送 /new <你的世界种子>。",
+                        text=_new_game_presets_text(),
+                        reply_markup=_new_game_presets_markup(),
                     )
                 ]
             )
@@ -203,35 +246,17 @@ class WorkerProcessor:
                 )
             if not await has_turn_credit(session, player):
                 return _quota_exhausted(parsed.telegram_chat_id)
-            try:
-                result = await self._with_typing(
-                    parsed.telegram_chat_id,
-                    build_and_persist_world(session, self.provider, player, seed),
-                )
-            except ActiveGameExistsError:
+            if seed is None:
                 return HandledUpdate(
                     reply_payload=[
                         message_payload(
-                            chat_id=parsed.telegram_chat_id, text="你已经有一局进行中的游戏。"
+                            chat_id=parsed.telegram_chat_id,
+                            text=_new_game_presets_text(),
+                            reply_markup=_new_game_presets_markup(),
                         )
                     ],
                 )
-            return HandledUpdate(
-                reply_payload=[
-                    message_payload(
-                        chat_id=parsed.telegram_chat_id,
-                        text=result.output.opening_narration,
-                        reply_markup={
-                            "inline_keyboard": [
-                                [{"text": action.label, "callback_data": action.callback_id}]
-                                for action in result.suggested_actions
-                            ]
-                        },
-                    )
-                ],
-                game_id=result.game.id,
-                turn_id=result.opening_turn.id,
-            )
+            return await self._build_new_game(session, parsed.telegram_chat_id, player, seed)
         player = await get_or_create_player(session, telegram_user_id=parsed.telegram_user_id)
         game = await session.scalar(
             select(Game).where(Game.player_id == player.id, Game.archived_at.is_(None))
@@ -299,6 +324,34 @@ class WorkerProcessor:
             game_id=game.id,
             turn_id=result.turn.id,
             safety_flags=result.safety_flags,
+        )
+
+    async def _build_new_game(
+        self,
+        session: AsyncSession,
+        chat_id: int,
+        player: Player,
+        seed: str,
+    ) -> HandledUpdate:
+        try:
+            result = await self._with_typing(
+                chat_id,
+                build_and_persist_world(session, self.provider, player, seed),
+            )
+        except ActiveGameExistsError:
+            return HandledUpdate(
+                reply_payload=[message_payload(chat_id=chat_id, text="你已经有一局进行中的游戏。")],
+            )
+        return HandledUpdate(
+            reply_payload=[
+                message_payload(
+                    chat_id=chat_id,
+                    text=result.output.opening_narration,
+                    reply_markup=_actions_markup(result.suggested_actions),
+                )
+            ],
+            game_id=result.game.id,
+            turn_id=result.opening_turn.id,
         )
 
     async def _handle_command(
@@ -488,6 +541,9 @@ class WorkerProcessor:
         self, update: TelegramUpdate, session: AsyncSession
     ) -> HandledUpdate:
         parsed = parse_recorded_update(update)
+        preset = _new_game_preset_from_callback(parsed.text)
+        if preset is not None:
+            return await self._handle_new_game_preset_callback(parsed, session, preset)
         action = await session.scalar(
             select(SuggestedAction).where(SuggestedAction.callback_id == (parsed.text or ""))
         )
@@ -559,6 +615,29 @@ class WorkerProcessor:
             safety_flags=result.safety_flags,
         )
 
+    async def _handle_new_game_preset_callback(
+        self,
+        parsed: Any,
+        session: AsyncSession,
+        preset: NewGamePreset,
+    ) -> HandledUpdate:
+        player = await get_or_create_player(session, telegram_user_id=parsed.telegram_user_id)
+        existing = await session.scalar(
+            select(Game).where(Game.player_id == player.id, Game.archived_at.is_(None))
+        )
+        if existing is not None:
+            return _active_game_exists(
+                parsed.telegram_chat_id,
+                callback_query_id=parsed.callback_query_id,
+            )
+        if not await has_turn_credit(session, player):
+            return _quota_exhausted(
+                parsed.telegram_chat_id,
+                callback_query_id=parsed.callback_query_id,
+            )
+        await self._answer_callback_now(parsed.callback_query_id)
+        return await self._build_new_game(session, parsed.telegram_chat_id, player, preset.seed)
+
     async def _answer_callback_now(self, callback_query_id: str | None) -> None:
         if not callback_query_id:
             return
@@ -596,13 +675,13 @@ class WorkerProcessor:
             )
 
 
-def _seed_from_text(text: str | None) -> str:
+def _seed_from_text(text: str | None) -> str | None:
     if not text:
-        return "一个适合中文文字 RPG 的悬疑世界。"
+        return None
     parts = text.split(maxsplit=1)
     if len(parts) == 2 and parts[1].strip():
         return parts[1].strip()
-    return "一个适合中文文字 RPG 的悬疑世界。"
+    return None
 
 
 def _help_text() -> str:
@@ -651,6 +730,32 @@ def _actions_markup(actions: list[Any]) -> dict[str, Any] | None:
             [{"text": action.label, "callback_data": action.callback_id}] for action in actions
         ]
     }
+
+
+def _new_game_presets_text() -> str:
+    return "请选择一个世界方向，或发送 /new <你的世界种子> 自定义。"
+
+
+def _new_game_presets_markup() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": preset.label,
+                    "callback_data": f"{NEW_PRESET_CALLBACK_PREFIX}{preset.key}",
+                }
+                for preset in NEW_GAME_PRESETS[index : index + 3]
+            ]
+            for index in range(0, len(NEW_GAME_PRESETS), 3)
+        ]
+    }
+
+
+def _new_game_preset_from_callback(callback_data: str | None) -> NewGamePreset | None:
+    if not callback_data or not callback_data.startswith(NEW_PRESET_CALLBACK_PREFIX):
+        return None
+    key = callback_data.removeprefix(NEW_PRESET_CALLBACK_PREFIX)
+    return next((preset for preset in NEW_GAME_PRESETS if preset.key == key), None)
 
 
 async def _list_archived_games(session: AsyncSession, player: Player) -> list[Game]:
@@ -719,6 +824,19 @@ def _dropped_callback(
         status=UpdateStatus.DROPPED,
         drop_reason=reason,
     )
+
+
+def _active_game_exists(
+    chat_id: int,
+    *,
+    callback_query_id: str | None = None,
+) -> HandledUpdate:
+    text = "你已经有一局进行中的游戏。"
+    payload = []
+    if callback_query_id:
+        payload.append(answer_callback_payload(callback_query_id=callback_query_id, text=text))
+    payload.append(message_payload(chat_id=chat_id, text=text))
+    return HandledUpdate(reply_payload=payload)
 
 
 def _quota_exhausted(
