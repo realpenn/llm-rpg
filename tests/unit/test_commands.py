@@ -355,6 +355,80 @@ async def test_new_game_requires_quota_before_calling_provider() -> None:
 
 
 @pytest.mark.asyncio
+async def test_new_without_seed_shows_direction_buttons_without_calling_provider() -> None:
+    session_factory = await _session_factory()
+    sender = Sender()
+    provider = FakeProvider()
+    async with session_factory() as session:
+        async with session.begin():
+            await record_telegram_update(session, _message_update(42, "/new"))
+
+    worker = WorkerProcessor(
+        session_factory=session_factory,
+        provider=provider,
+        sender=sender,
+        settings=Settings(),
+    )
+    await worker.process_update_id(42)
+
+    async with session_factory() as session:
+        update = await session.get(TelegramUpdate, 42)
+        game = await session.scalar(select(Game))
+
+    keyboard = sender.messages[0]["reply_markup"]["inline_keyboard"]
+    labels = [button["text"] for row in keyboard for button in row]
+    callbacks = [button["callback_data"] for row in keyboard for button in row]
+
+    assert provider.calls == []
+    assert game is None
+    assert update is not None
+    assert update.status == UpdateStatus.COMPLETED
+    assert sender.messages[0]["text"] == "请选择一个世界方向，或发送 /new <你的世界种子> 自定义。"
+    assert [len(row) for row in keyboard] == [3, 3]
+    assert labels == ["悬疑", "恐怖", "恋爱", "都市", "修仙", "科幻"]
+    assert all(callback.startswith("new:") for callback in callbacks)
+    assert all(len(callback.encode("utf-8")) <= 64 for callback in callbacks)
+
+
+@pytest.mark.asyncio
+async def test_new_direction_callback_builds_world_from_preset_seed() -> None:
+    session_factory = await _session_factory()
+    sender = Sender()
+    provider = FakeProvider(responses=[_world_build_output()])
+    worker = WorkerProcessor(
+        session_factory=session_factory,
+        provider=provider,
+        sender=sender,
+        settings=Settings(),
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await record_telegram_update(session, _message_update(43, "/new"))
+    await worker.process_update_id(43)
+
+    callback_id = sender.messages[0]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    async with session_factory() as session:
+        async with session.begin():
+            await record_telegram_update(session, _callback_update(44, callback_id))
+    await worker.process_update_id(44)
+
+    async with session_factory() as session:
+        update = await session.get(TelegramUpdate, 44)
+        game = await session.scalar(select(Game))
+
+    assert len(provider.calls) == 1
+    assert "悬疑世界" in provider.calls[0][0][-1].content
+    assert game is not None
+    assert update is not None
+    assert update.status == UpdateStatus.COMPLETED
+    assert update.game_id == game.id
+    assert sender.messages[1]["method"] == "answerCallbackQuery"
+    assert sender.messages[1]["text"] == "处理中..."
+    assert sender.messages[2]["text"] == "你在旧城档案馆门前醒来。"
+    assert len(sender.messages[2]["reply_markup"]["inline_keyboard"]) == 3
+
+
+@pytest.mark.asyncio
 async def test_exhausted_quota_skips_input_moderation() -> None:
     class ModerationProbe:
         def __init__(self) -> None:
@@ -552,6 +626,72 @@ async def _seed_active_game(session) -> Game:
     await session.flush()
     assert len(b"act_current") <= 64
     return game
+
+
+def _world_build_output() -> dict:
+    return {
+        "world": {
+            "summary": "旧城被雨困住。",
+            "language": "zh-CN",
+            "genre": "mystery fantasy",
+            "tone": "冷静",
+            "era_geography": "近代海港旧城",
+            "locked_laws": ["雨会记录谎言"],
+            "factions": [
+                {
+                    "key": "council",
+                    "name": "旧城议会",
+                    "description": "管理旧城",
+                    "ideology": "秩序",
+                }
+            ],
+            "locations": [
+                {"key": "old_city", "name": "旧城", "description": "潮湿的街区"},
+            ],
+            "player_stat_schema": {
+                "vitals": {
+                    "hp": {"min": 0, "max": 10, "default": 8},
+                    "energy": {"min": 0, "max": 10, "default": 5},
+                },
+                "currency": {"coin": {"min": 0, "max": 999, "default": 2}},
+                "allowed_conditions": ["watched", "wounded"],
+                "allowed_flags": {
+                    "knows_clock_secret": {"type": "boolean"},
+                },
+            },
+            "initial_location": "old_city",
+            "initial_npcs": [
+                {
+                    "key": "archivist",
+                    "name": "闻鹤",
+                    "role": "keeper",
+                    "faction": "council",
+                    "location": "old_city",
+                    "personality": "谨慎",
+                    "desire": "保护档案",
+                    "fear": "档案被毁",
+                    "goal": "确认玩家可信",
+                }
+            ],
+            "dangers": ["宵禁"],
+            "available_roles": ["runner"],
+            "narrative_style": "第二人称",
+            "taboos": ["不改写雨的规则"],
+            "core_conflict": "议会掩盖停钟真相。",
+        },
+        "opening_narration": "你在旧城档案馆门前醒来。",
+        "player_state": {
+            "name": "阿岚",
+            "profession": "runner",
+            "location": "old_city",
+            "vitals": {"hp": 8, "energy": 5},
+            "currency": {"coin": 2},
+            "conditions": [],
+            "flags": {},
+            "inventory": {},
+        },
+        "initial_suggested_actions": ["查看档案馆", "寻找巡夜人", "检查随身物品"],
+    }
 
 
 def _message_update(update_id: int, text: str) -> dict:

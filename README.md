@@ -44,7 +44,7 @@ uv run alembic upgrade head
 ## Telegram 命令
 
 - `/start`、`/help`：查看入口和帮助。
-- `/new`、`/worlds`：创建新游戏或查看世界预设；`/new` 需要玩家仍有回合额度。
+- `/new`、`/worlds`：创建新游戏或查看世界预设；`/new` 不带种子会展示方向按钮，`/new <种子>` 会直接使用自定义种子，创建世界需要玩家仍有回合额度。
 - `/world`、`/people`、`/status`、`/inventory`：查看当前游戏状态。
 - `/quota`：查看剩余回合额度。
 - `/recharge <code>`：兑换一次性充值码。

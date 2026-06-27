@@ -17,9 +17,9 @@ The game is inspired by AI text RPG design patterns such as:
 ### New Game Flow
 
 1. The player sends `/new`.
-2. The bot offers built-in presets and a custom world option.
-3. For a custom world, the player writes one paragraph as a world seed.
-4. The LLM expands that seed into a structured `WorldBible`.
+2. If `/new` includes seed text, that text is used directly as the custom world seed.
+3. If `/new` has no seed text, the bot offers built-in direction presets such as 悬疑、恐怖、恋爱、都市、修仙、科幻 as inline buttons arranged in two or three rows. The player may also send `/new <seed>` to provide a custom world.
+4. The LLM expands the selected preset seed or custom seed into a structured `WorldBible`.
 5. The player confirms the world preview.
 6. After confirmation, the world bible is locked and the first scene begins.
 
